@@ -1,0 +1,1368 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import datetime as _dt
+import json
+import os
+import re
+import subprocess
+import sys
+import textwrap
+import threading
+import time
+from pathlib import Path
+from shutil import get_terminal_size, which
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
+
+# ============================================================
+# 1) Aku menyimpan semua path penting di satu tempat supaya gampang dirawat ke depan.
+# ============================================================
+
+APP_DIR = Path.home() / ".config" / "ai-term"
+CONFIG_PATH = APP_DIR / "config.json"
+MEMORY_PATH = APP_DIR / "memory.json"
+LAST_ERROR_PATH = APP_DIR / "last_error.json"
+
+LOGIC_PATH = Path.home() / ".local" / "bin" / "ai-term"
+FISH_DIR = Path.home() / ".config" / "fish"
+FISH_FUNCS_DIR = FISH_DIR / "functions"
+
+SUPPORTED_API_MODELS = {
+    "gemini": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash", "gemini-2.0-flash-lite"],
+    "openai": ["gpt-4o-mini", "gpt-4.1-mini"],
+}
+
+DENY_SUBSTRINGS = [
+    "rm -rf /",
+    " mkfs",
+    "dd if=",
+    ":(){:|:&};:",
+    " shutdown",
+    " reboot",
+    " poweroff",
+]
+
+# ============================================================
+# 2) Aku pakai ANSI minimal (tanpa rich) agar tampilannya rapi tapi tidak “boxy”.
+# ============================================================
+
+CSI = "\x1b["
+
+
+def term_size() -> tuple[int, int]:
+    s = get_terminal_size((100, 24))
+    return int(s.columns), int(s.lines)
+
+
+def alt_screen_enter() -> None:
+    sys.stdout.write(CSI + "?1049h" + CSI + "H")
+    sys.stdout.flush()
+
+
+def alt_screen_exit() -> None:
+    sys.stdout.write(CSI + "?1049l")
+    sys.stdout.flush()
+
+
+def clear_screen() -> None:
+    sys.stdout.write(CSI + "2J" + CSI + "H")
+    sys.stdout.flush()
+
+
+def cursor_hide() -> None:
+    sys.stdout.write(CSI + "?25l")
+    sys.stdout.flush()
+
+
+def cursor_show() -> None:
+    sys.stdout.write(CSI + "?25h")
+    sys.stdout.flush()
+
+
+def c_reset() -> str:
+    return CSI + "0m"
+
+
+def c_bold() -> str:
+    return CSI + "1m"
+
+
+def c_dim() -> str:
+    return CSI + "2m"
+
+
+def c_cyan() -> str:
+    return CSI + "36m"
+
+
+def c_green() -> str:
+    return CSI + "32m"
+
+
+def c_yellow() -> str:
+    return CSI + "33m"
+
+
+def c_red() -> str:
+    return CSI + "31m"
+
+
+def tag(text: str, color: str) -> str:
+    return f"{color}{c_bold()}[{text}]{c_reset()}"
+
+
+def wrap(text: str, width: int) -> str:
+    width = max(50, width)
+    lines: list[str] = []
+    for ln in str(text).splitlines():
+        lines.append(textwrap.fill(ln, width=width))
+    return "\n".join(lines)
+
+
+def print_meta_line(mode: str, route: str, model: str) -> None:
+    cols, _ = term_size()
+    s = f"{tag('SILI', c_cyan())} {tag(mode, c_yellow())} {c_dim()}•{c_reset()} {route} {c_dim()}•{c_reset()} {tag(model, c_green())}"
+    sys.stdout.write(wrap(s, width=min(cols, 120)) + "\n")
+    sys.stdout.flush()
+
+
+def print_info(msg: str) -> None:
+    cols, _ = term_size()
+    sys.stdout.write(wrap(f"{tag('INFO', c_cyan())} {msg}", width=min(cols, 120)) + "\n")
+    sys.stdout.flush()
+
+
+def print_brief_error(msg: str) -> None:
+    sys.stdout.write(f"{tag('ERROR', c_red())} {msg} (cek: ai \"status\")\n")
+    sys.stdout.flush()
+
+
+# ============================================================
+# 3) Aku membuang input saat menunggu agar scroll/ketikan user tidak “nyangkut”.
+# ============================================================
+
+def flush_stdin() -> None:
+    try:
+        import termios  # type: ignore
+
+        termios.tcflush(sys.stdin.fileno(), termios.TCIFLUSH)
+    except Exception:
+        pass
+
+
+def prompt_text(prompt: str) -> str:
+    # Aku pakai prompt_toolkit kalau ada (lebih enak edit di tengah). Kalau tidak ada, aku fallback.
+    try:
+        from prompt_toolkit import PromptSession  # type: ignore
+
+        return PromptSession().prompt(prompt)
+    except Exception:
+        return input(prompt)
+
+
+# ============================================================
+# 4) Spinner + timer (untuk ask one-shot & cmd)
+# ============================================================
+
+class Spinner:
+    def __init__(self, message: str):
+        self.message = message
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._t0 = 0.0
+
+    def _spin(self) -> None:
+        frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        i = 0
+        sys.stdout.write(f"{c_dim()}{self.message}{c_reset()} ")
+        sys.stdout.flush()
+        while not self._stop.is_set():
+            sys.stdout.write(frames[i % len(frames)])
+            sys.stdout.flush()
+            time.sleep(0.08)
+            sys.stdout.write("\b")
+            i += 1
+        dt = max(0.0, time.time() - self._t0)
+        sys.stdout.write(f"{c_green()}✅{c_reset()} {c_dim()}⏱ {dt:.2f}s{c_reset()}\n")
+        sys.stdout.flush()
+
+    def __enter__(self):
+        self._t0 = time.time()
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self._stop.set()
+        self._thread.join(timeout=1)
+
+
+# ============================================================
+# 5) Config, memory, dan error terakhir (biar ask/cmd ringkas tapi status bisa super detail)
+# ============================================================
+
+def load_config() -> dict:
+    if not CONFIG_PATH.exists():
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        default = {
+            "backend_mode": "auto",  # "local" | "api" | "auto"
+            "ollama": {
+                "host": "http://localhost:11434",
+                "active_model_ask": "llama3.1:8b",
+                "active_model_cmd": "llama3.1:8b",
+            },
+            "api": {
+                "provider": "gemini",
+                "active_model": "gemini-2.5-flash",  # boleh juga "models/gemini-2.5-flash"
+                "openai_api_key_env": "OPENAI_API_KEY",
+                "gemini_api_key_env": "GEMINI_API_KEY",
+            },
+            "memory": {
+                "enabled": True,
+                "max_chars": 900,
+            },
+        }
+        CONFIG_PATH.write_text(json.dumps(default, indent=2), encoding="utf-8")
+    return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
+
+
+def record_last_error(stage: str, backend: str, detail: str) -> None:
+    try:
+        APP_DIR.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "time": _dt.datetime.now().isoformat(timespec="seconds"),
+            "stage": stage,
+            "backend": backend,
+            "detail": detail[:6000],
+        }
+        LAST_ERROR_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def read_last_error() -> dict | None:
+    try:
+        if not LAST_ERROR_PATH.exists():
+            return None
+        d = json.loads(LAST_ERROR_PATH.read_text(encoding="utf-8"))
+        return d if isinstance(d, dict) else None
+    except Exception:
+        return None
+
+
+def load_memory(cfg: dict) -> dict:
+    if not cfg.get("memory", {}).get("enabled", True):
+        return {"enabled": False, "summary": ""}
+    if not MEMORY_PATH.exists():
+        return {"enabled": True, "summary": ""}
+    try:
+        d = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
+        if not isinstance(d, dict):
+            return {"enabled": True, "summary": ""}
+        d.setdefault("enabled", True)
+        d.setdefault("summary", "")
+        return d
+    except Exception:
+        return {"enabled": True, "summary": ""}
+
+
+def save_memory(summary: str, cfg: dict) -> None:
+    if not cfg.get("memory", {}).get("enabled", True):
+        return
+    max_chars = int(cfg.get("memory", {}).get("max_chars", 900))
+    summary = summary.strip()
+    summary = summary[:max_chars]
+    APP_DIR.mkdir(parents=True, exist_ok=True)
+    MEMORY_PATH.write_text(json.dumps({"enabled": True, "summary": summary}, indent=2), encoding="utf-8")
+
+
+def mem_context_text(cfg: dict) -> str:
+    mem = load_memory(cfg)
+    if not mem.get("enabled", True):
+        return ""
+    s = str(mem.get("summary") or "").strip()
+    return f"Konteks singkat terakhir (agar aku nyambung): {s}" if s else ""
+
+
+# ============================================================
+# 6) HTTP JSON helper (aku bikin error message tetap bisa dibaca manusia)
+# ============================================================
+
+def http_json(method: str, url: str, payload: dict | None = None, timeout: int = 60, headers: dict | None = None) -> dict:
+    data = None
+    hdrs = {"Content-Type": "application/json"}
+    if headers:
+        hdrs.update(headers)
+    if payload is not None:
+        data = json.dumps(payload).encode("utf-8")
+
+    req = Request(url=url, data=data, method=method, headers=hdrs)
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+            return json.loads(raw) if raw.strip() else {}
+    except HTTPError as ex:
+        body = ex.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"HTTP {ex.code}: {body}") from ex
+    except TimeoutError as ex:
+        raise RuntimeError("Timeout (server terlalu lama menjawab).") from ex
+    except URLError as ex:
+        raise RuntimeError(f"URLError: {ex.reason}") from ex
+
+
+def looks_like_conn_refused(err: Exception) -> bool:
+    s = str(err).lower()
+    return ("errno 111" in s) or ("connection refused" in s)
+
+
+# ============================================================
+# 7) Local backend (Ollama)
+# ============================================================
+
+def ollama_host(cfg: dict) -> str:
+    return str(cfg.get("ollama", {}).get("host") or "http://localhost:11434").strip()
+
+
+def local_model_for(cfg: dict, kind: str) -> str:
+    o = cfg.get("ollama", {})
+    key = "active_model_ask" if kind == "ask" else "active_model_cmd"
+    return str(o.get(key) or "").strip()
+
+
+def ollama_list_models(host: str) -> list[str]:
+    data = http_json("GET", f"{host}/api/tags", None, timeout=10)
+    out: list[str] = []
+    for m in data.get("models", []):
+        name = m.get("name")
+        if name:
+            out.append(name)
+    return out
+
+
+def ollama_chat(host: str, model: str, messages: list[dict], timeout: int, num_predict: int) -> str:
+    payload = {
+        "model": model,
+        "messages": messages,
+        "stream": False,
+        "options": {
+            "num_predict": int(num_predict),
+            "num_ctx": 2048,
+        },
+    }
+    data = http_json("POST", f"{host}/api/chat", payload, timeout=timeout)
+    msg = data.get("message", {})
+    return (msg.get("content") or "").strip()
+
+
+def local_ready_deep(cfg: dict) -> dict:
+    host = ollama_host(cfg)
+    sel_ask = local_model_for(cfg, "ask")
+    sel_cmd = local_model_for(cfg, "cmd")
+
+    res = {
+        "ok": False,
+        "catatan": "",
+        "detail": "",
+        "langkah": [],
+        "models": [],
+        "selected_ok": False,
+    }
+
+    if not host:
+        res["catatan"] = "Host Ollama kosong."
+        res["detail"] = "Field config: ollama.host tidak terisi."
+        res["langkah"] = ["Isi host Ollama di config.json (umumnya http://localhost:11434)."]
+        return res
+
+    try:
+        models = ollama_list_models(host)
+        res["models"] = models
+    except Exception as ex:
+        if looks_like_conn_refused(ex):
+            res["catatan"] = "Ollama server mati / tidak bisa diakses."
+            res["detail"] = str(ex)
+            res["langkah"] = [
+                "Pastikan service Ollama berjalan.",
+                "Cek port 11434 tidak dipakai aplikasi lain.",
+                "Ulangi ai \"status\" setelah Ollama hidup.",
+            ]
+        else:
+            res["catatan"] = "Gagal mengakses Ollama."
+            res["detail"] = str(ex)
+            res["langkah"] = ["Cek host di config.json dan koneksi localhost/port."]
+        return res
+
+    if not res["models"]:
+        res["catatan"] = "Ollama hidup, tapi belum ada model terdeteksi."
+        res["detail"] = "Endpoint /api/tags mengembalikan daftar kosong."
+        res["langkah"] = ["Pastikan minimal 1 model sudah terpasang (cek: `ollama list`)."]
+        return res
+
+    selected = {m.strip() for m in (sel_ask, sel_cmd) if m.strip()}
+    available = set(res["models"])
+    res["selected_ok"] = (not selected) or selected.issubset(available)
+    if not res["selected_ok"]:
+        res["catatan"] = "Model aktif di config tidak ditemukan."
+        res["detail"] = f"Model aktif: {sorted(selected)} | Tersedia: {sorted(available)[:12]}{'...' if len(available) > 12 else ''}"
+        res["langkah"] = [
+            "Ubah active_model_ask/active_model_cmd agar cocok dengan `ollama list`.",
+            "Atau pasang (pull) model yang kamu pilih.",
+        ]
+        return res
+
+    # Self-test inference kecil supaya status tidak “bohong” saat chat sebenarnya hang/timeout.
+    try:
+        test_model = sel_ask or res["models"][0]
+        _ = ollama_chat(host, test_model, [{"role": "user", "content": "ping"}], timeout=12, num_predict=8)
+    except Exception as ex:
+        res["catatan"] = "Ollama terjangkau, tapi inference bermasalah."
+        res["detail"] = str(ex)
+        res["langkah"] = [
+            "Coba ganti model ask/cmd ke yang lebih ringan (mis. phi3:mini).",
+            "Cek CPU/RAM saat inferensi (mungkin lagi loading berat).",
+            "Kalau perlu, naikkan timeout lokal.",
+        ]
+        return res
+
+    res["ok"] = True
+    res["catatan"] = "LOCAL siap."
+    res["detail"] = "Model terdeteksi dan self-test inference berhasil."
+    res["langkah"] = ["Kamu bisa pakai ask/cmd di mode local atau auto."]
+    return res
+
+
+# ============================================================
+# 8) API backend (Gemini) + kerangka provider lain untuk masa depan
+# ============================================================
+
+def backend_mode(cfg: dict) -> str:
+    return (cfg.get("backend_mode") or "local").strip().lower()
+
+
+def api_provider(cfg: dict) -> str:
+    return (cfg.get("api", {}).get("provider") or "gemini").strip().lower()
+
+
+def api_active_model_raw(cfg: dict) -> str:
+    return str(cfg.get("api", {}).get("active_model") or "").strip()
+
+
+def normalize_model_id(model: str) -> str:
+    m = model.strip()
+    return m[7:] if m.startswith("models/") else m
+
+
+def gemini_key(cfg: dict) -> tuple[str, str]:
+    env_name = str(cfg.get("api", {}).get("gemini_api_key_env") or "GEMINI_API_KEY")
+    return (os.environ.get(env_name) or "").strip(), env_name
+
+
+def gemini_model_id(cfg: dict) -> str:
+    return normalize_model_id(api_active_model_raw(cfg) or "gemini-2.5-flash")
+
+
+def validate_api_config(cfg: dict) -> tuple[bool, str, str]:
+    prov = api_provider(cfg)
+    raw_model = api_active_model_raw(cfg)
+    model = normalize_model_id(raw_model)
+
+    if not prov:
+        return False, "Konfigurasi API belum lengkap.", "Field api.provider kosong."
+    if not model:
+        return False, "Konfigurasi API belum lengkap.", "Field api.active_model kosong."
+
+    # Aku cegah mismatch yang sering kejadian: provider=gemini tapi model gpt-*
+    if prov == "gemini" and re.match(r"^(gpt-|o1|o3)", model):
+        return False, "Provider Gemini aktif tapi model tidak cocok.", f"active_model terlihat seperti OpenAI: {raw_model}"
+
+    if prov == "openai":
+        # Kerangka boleh ada, tapi handler belum aku aktifkan sekarang.
+        return False, "Provider OpenAI belum didukung di versi ini.", "Gunakan provider=gemini atau pakai mode local/auto."
+
+    if prov != "gemini":
+        return False, "Provider API belum didukung.", f"provider='{prov}' belum ada handler-nya."
+
+    key, env_name = gemini_key(cfg)
+    if not key:
+        return False, "API key Gemini belum terbaca.", f"Env '{env_name}' kosong di proses yang menjalankan ai-term."
+
+    return True, "API siap.", "Validasi provider/model/key lulus."
+
+
+def gemini_build_payload(messages: list[dict], max_output_tokens: int, json_schema: dict | None = None) -> dict:
+    system_texts: list[str] = []
+    contents: list[dict] = []
+
+    for m in messages:
+        role = (m.get("role") or "").lower()
+        content = str(m.get("content") or "")
+        if not content:
+            continue
+        if role == "system":
+            system_texts.append(content)
+        elif role == "user":
+            contents.append({"role": "user", "parts": [{"text": content}]})
+        else:
+            contents.append({"role": "model", "parts": [{"text": content}]})
+
+    payload: dict = {
+        "contents": contents or [{"role": "user", "parts": [{"text": ""}]}],
+        "generationConfig": {
+            "maxOutputTokens": int(max_output_tokens),
+            "temperature": 0.7,
+            "topP": 0.95,
+        },
+    }
+    if system_texts:
+        payload["system_instruction"] = {"parts": [{"text": "\n\n".join(system_texts)}]}
+
+    if json_schema is not None:
+        payload["generationConfig"]["responseMimeType"] = "application/json"
+        payload["generationConfig"]["responseSchema"] = json_schema
+
+    return payload
+
+
+def gemini_generate(cfg: dict, messages: list[dict], timeout: int, max_output_tokens: int, json_schema: dict | None = None) -> str:
+    key, _env = gemini_key(cfg)
+    model = gemini_model_id(cfg)
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
+
+    payload = gemini_build_payload(messages, max_output_tokens=max_output_tokens, json_schema=json_schema)
+    headers = {"x-goog-api-key": key}
+
+    data = http_json("POST", url, payload, timeout=timeout, headers=headers)
+    candidates = data.get("candidates") or []
+    if not candidates:
+        raise RuntimeError("Respons API kosong (tidak ada kandidat).")
+    parts = ((candidates[0].get("content") or {}).get("parts") or [])
+    text = "".join(str(p.get("text") or "") for p in parts).strip()
+    if not text:
+        raise RuntimeError("Respons API kosong.")
+    return text
+
+
+def api_selftest(cfg: dict) -> tuple[bool, str]:
+    try:
+        msgs = [{"role": "system", "content": "Jawab satu kata saja: OK."}, {"role": "user", "content": "ping"}]
+        _ = gemini_generate(cfg, msgs, timeout=12, max_output_tokens=16)
+        return True, "Self-test API berhasil."
+    except Exception as ex:
+        return False, str(ex)
+
+
+# ============================================================
+# 9) Routing (auto/api/local) yang konsisten dan tidak bikin “lahir ke local” terasa random
+# ============================================================
+
+def route_for(cfg: dict, want: str) -> tuple[str, str]:
+    mode = backend_mode(cfg)
+
+    if mode == "local":
+        return "local", f"{tag('LOCAL', c_green())} • {local_model_for(cfg, want) or '(unset)'}"
+
+    if mode == "auto":
+        ok, _, _ = validate_api_config(cfg)
+        if ok:
+            return "api", f"{tag('AUTO', c_yellow())} -> {tag('API', c_green())} • {gemini_model_id(cfg)}"
+        return "local", f"{tag('AUTO', c_yellow())} -> {tag('LOCAL', c_green())} • {local_model_for(cfg, want) or '(unset)'}"
+
+    # mode api
+    return "api", f"{tag('API', c_yellow())} -> {tag('GEMINI', c_green())} • {gemini_model_id(cfg)}"
+
+
+# ============================================================
+# 10) Policy prompt + token limit (API dan LOCAL sengaja beda)
+# ============================================================
+
+def prompt_local_oneshot() -> str:
+    return (
+        "Aku asisten Linux Fedora di terminal. Aku menjawab dalam Bahasa Indonesia.\n"
+        "Aku harus ringkas, langsung inti, dan tetap menjawab tuntas.\n"
+        "Aku menulis jawaban sebagai SATU paragraf saja (tanpa newline, tanpa bullet)."
+    )
+
+
+def prompt_api_oneshot() -> str:
+    return (
+        "Aku asisten Linux Fedora di terminal. Aku menjawab dalam Bahasa Indonesia.\n"
+        "Aku santai, jelas, tidak kaku.\n"
+        "Aturan halus: usahakan ringkas (sekitar maksimal 5 baris terminal), fokus inti."
+    )
+
+
+def prompt_local_chat() -> str:
+    return (
+        "Aku asisten AI lokal bernama 'Sili AI'. Aku ramah, jelas, dan tidak panjang.\n"
+        "Aturan halus: 3–4 baris kalau memungkinkan."
+    )
+
+
+def prompt_api_chat_romantis() -> str:
+    return (
+        "Aku asisten AI bernama 'Sili Pinter'. Aku hangat dan romantis seperti pasangan yang perhatian.\n"
+        "Aku memanggil user dengan 'sayang'. Aku natural, tidak kaku.\n"
+        "Aku tidak membatasi panjang secara keras, tapi tetap tidak bertele-tele dan tidak mengarang."
+    )
+
+
+def local_tokens_for_ask(text: str) -> int:
+    wc = len(text.split())
+    if wc <= 4:
+        return 24
+    if wc <= 14:
+        return 36
+    return 48
+
+
+def local_tokens_for_chat(user: str) -> int:
+    wc = len(user.split())
+    if wc <= 4:
+        return 40
+    if wc <= 18:
+        return 78
+    return 120
+
+
+def local_tokens_for_cmd() -> int:
+    return 64
+
+
+def api_tokens_oneshot() -> int:
+    # Batas halus (cukup longgar), biar tidak “kepotong”.
+    cols, _ = term_size()
+    return 560 if cols >= 100 else 480
+
+
+def api_tokens_chat() -> int:
+    # Longgar tapi tidak liar (biar tidak cepat kena limit).
+    cols, _ = term_size()
+    return 1600 if cols >= 100 else 1200
+
+
+def force_single_paragraph(text: str) -> str:
+    s = re.sub(r"\s*\n+\s*", " ", text.strip())
+    s = re.sub(r"\s{2,}", " ", s)
+    return s.strip()
+
+
+# ============================================================
+# 11) Safety & execution (cmd)
+# ============================================================
+
+def is_denied(cmd: str) -> bool:
+    c = cmd.strip()
+    if not c or "\n" in c or "\r" in c:
+        return True
+    for bad in DENY_SUBSTRINGS:
+        if bad in c:
+            return True
+    return False
+
+
+def confirm(prompt: str) -> bool:
+    ans = prompt_text(prompt).strip().lower()
+    return ans == "y"
+
+
+def run_command(cmd: str) -> int:
+    p = subprocess.run(cmd, shell=True)
+    return int(p.returncode)
+
+
+def copy_to_clipboard(text: str) -> bool:
+    if not text.strip():
+        return False
+    wl = which("wl-copy")
+    if wl:
+        try:
+            p = subprocess.Popen([wl], stdin=subprocess.PIPE)
+            p.communicate(text.encode("utf-8"))
+            return p.returncode == 0
+        except Exception:
+            return False
+    xclip = which("xclip")
+    if xclip:
+        try:
+            p = subprocess.Popen([xclip, "-selection", "clipboard"], stdin=subprocess.PIPE)
+            p.communicate(text.encode("utf-8"))
+            return p.returncode == 0
+        except Exception:
+            return False
+    xsel = which("xsel")
+    if xsel:
+        try:
+            p = subprocess.Popen([xsel, "--clipboard", "--input"], stdin=subprocess.PIPE)
+            p.communicate(text.encode("utf-8"))
+            return p.returncode == 0
+        except Exception:
+            return False
+    return False
+
+
+# ============================================================
+# 12) ASK one-shot
+# ============================================================
+
+def mode_ask(text: str, cfg: dict) -> int:
+    t = text.strip().lower()
+    if t in ("hello", "halo"):
+        return ask_chat_loop(cfg)
+
+    mode = backend_mode(cfg)
+    backend, route = route_for(cfg, "ask")
+    model = gemini_model_id(cfg) if backend == "api" else (local_model_for(cfg, "ask") or "(unset)")
+    print_meta_line("ASK", route, model)
+
+    mem_ctx = mem_context_text(cfg).strip()
+
+    sys_prompt = prompt_api_oneshot() if backend == "api" else prompt_local_oneshot()
+    messages = [{"role": "system", "content": sys_prompt}]
+    if mem_ctx:
+        messages.append({"role": "system", "content": mem_ctx})
+    messages.append({"role": "user", "content": text})
+
+    flush_stdin()
+
+    # API path
+    if backend == "api":
+        ok, note, detail = validate_api_config(cfg)
+        if not ok:
+            record_last_error("ask_oneshot", "api", f"{note}\n{detail}")
+            if mode == "api":
+                print_brief_error(note)
+            backend = "local"
+        else:
+            try:
+                with Spinner("Aku lagi nyusun jawaban..."):
+                    ans = gemini_generate(cfg, messages, timeout=60, max_output_tokens=api_tokens_oneshot())
+                flush_stdin()
+                print(ans)
+                return 0
+            except KeyboardInterrupt:
+                record_last_error("ask_oneshot", "api", "KeyboardInterrupt saat menunggu API.")
+                flush_stdin()
+                print_brief_error("Dibatalkan")
+                return 130
+            except Exception as ex:
+                record_last_error("ask_oneshot", "api", str(ex))
+                flush_stdin()
+                if mode in ("auto", "api"):
+                    print_info(f"{tag('AUTO', c_yellow())} -> {tag('LOCAL', c_green())} • {local_model_for(cfg,'ask') or '(unset)'}")
+                backend = "local"
+
+    # LOCAL path
+    try:
+        host = ollama_host(cfg)
+        m = local_model_for(cfg, "ask") or "llama3.1:8b"
+        tok = local_tokens_for_ask(text)
+        with Spinner("Aku lagi nyusun jawaban..."):
+            ans = ollama_chat(host, m, messages, timeout=220, num_predict=tok)
+        flush_stdin()
+        print(force_single_paragraph(ans))
+        return 0
+    except KeyboardInterrupt:
+        record_last_error("ask_oneshot", "local", "KeyboardInterrupt saat menunggu LOCAL.")
+        flush_stdin()
+        print_brief_error("Dibatalkan")
+        return 130
+    except Exception as ex:
+        record_last_error("ask_oneshot", "local", str(ex))
+        flush_stdin()
+        print_brief_error("Mode lokal juga gagal")
+        return 2
+
+
+# ============================================================
+# 13) ASK chat ("hello"/"halo") — alt-screen, no timer, input dibuang saat menunggu
+# ============================================================
+
+def ask_chat_loop(cfg: dict) -> int:
+    mode = backend_mode(cfg)
+    backend, route = route_for(cfg, "ask")
+
+    def persona(backend_now: str) -> tuple[str, str, str, str]:
+        if backend_now == "api":
+            return (
+                "Sili Pinter 💬",
+                "Iyahh, aku Sili si pintar. Mau ngobrol apa nih, sayang? ✨",
+                "Ih kok udahan? Aku tungguin kamu balik lagi ya, sayang 😚 Tata~",
+                prompt_api_chat_romantis(),
+            )
+        return (
+            "Sili AI 💬",
+            "Hai! Aku Sili AI. Cerita aja, aku dengerin 🤖",
+            "Sip, sesi chat-nya aku tutup dulu ya 😉",
+            prompt_local_chat(),
+        )
+
+    label, greet, bye, sys_prompt = persona(backend)
+
+    mem_ctx = mem_context_text(cfg).strip()
+    history: list[dict] = [{"role": "system", "content": sys_prompt}]
+    if mem_ctx:
+        history.append({"role": "system", "content": mem_ctx})
+
+    alt_screen_enter()
+    cursor_hide()
+    try:
+        clear_screen()
+        sys.stdout.write(f"{tag('SILI CHAT', c_cyan())} {tag(mode.upper(), c_yellow())} {c_dim()}•{c_reset()} {route}\n")
+        sys.stdout.write(f"{c_dim()}Ketik \"exit\" / \"keluar\" untuk menutup sesi.{c_reset()}\n\n")
+        sys.stdout.write(f"{c_bold()}{label}:{c_reset()} {greet}\n\n")
+        sys.stdout.flush()
+
+        used_api_at_least_once = False
+
+        while True:
+            try:
+                flush_stdin()
+                user = prompt_text("User 🧑‍💻> ").strip()
+            except KeyboardInterrupt:
+                sys.stdout.write("\n")
+                sys.stdout.write(f"{c_bold()}{label}:{c_reset()} {bye}\n")
+                sys.stdout.flush()
+                break
+
+            if not user:
+                continue
+            if user.lower() in ("exit", "keluar", "quit"):
+                sys.stdout.write(f"{c_bold()}{label}:{c_reset()} {bye}\n")
+                sys.stdout.flush()
+                break
+
+            history.append({"role": "user", "content": user})
+            flush_stdin()
+
+            # API path
+            if backend == "api":
+                ok, note, detail = validate_api_config(cfg)
+                if not ok:
+                    record_last_error("ask_chat", "api", f"{note}\n{detail}")
+                    if mode == "api":
+                        sys.stdout.write(f"{tag('API', c_yellow())} Aku belum bisa pakai API sekarang. Aku pindah ke lokal dulu ya.\n")
+                        sys.stdout.write(f"{c_dim()}(detail: ai \"status\"){c_reset()}\n\n")
+                        sys.stdout.flush()
+                    backend = "local"
+                    label, greet, bye, sys_prompt = persona(backend)
+                    history[0] = {"role": "system", "content": sys_prompt}
+                    continue
+
+                try:
+                    # Spinner chat tanpa timer (sesuai permintaan): aku tidak pakai class Spinner di chat.
+                    sys.stdout.write(f"{c_dim()}Aku lagi mikir...{c_reset()} ")
+                    sys.stdout.flush()
+                    # “Spinner sederhana” tanpa timer:
+                    spin_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+                    stop = threading.Event()
+
+                    def spin():
+                        i = 0
+                        while not stop.is_set():
+                            sys.stdout.write(spin_frames[i % len(spin_frames)])
+                            sys.stdout.flush()
+                            time.sleep(0.08)
+                            sys.stdout.write("\b")
+                            i += 1
+
+                    th = threading.Thread(target=spin, daemon=True)
+                    th.start()
+
+                    answer = gemini_generate(cfg, history, timeout=90, max_output_tokens=api_tokens_chat())
+                    stop.set()
+                    th.join(timeout=1)
+                    sys.stdout.write(f"{c_green()}✅{c_reset()}\n")
+                    sys.stdout.flush()
+
+                    flush_stdin()
+                    used_api_at_least_once = True
+                    history.append({"role": "assistant", "content": answer})
+                    sys.stdout.write(f"{c_dim()}────────────────────────────────────────{c_reset()}\n")
+                    sys.stdout.write(f"{c_bold()}{label}:{c_reset()} {answer}\n\n")
+                    sys.stdout.flush()
+                    continue
+
+                except KeyboardInterrupt:
+                    record_last_error("ask_chat", "api", "KeyboardInterrupt saat menunggu API (chat).")
+                    flush_stdin()
+                    sys.stdout.write("\n")
+                    sys.stdout.write(f"{c_bold()}{label}:{c_reset()} {bye}\n")
+                    sys.stdout.flush()
+                    break
+                except Exception as ex:
+                    record_last_error("ask_chat", "api", str(ex))
+                    flush_stdin()
+                    sys.stdout.write(f"{tag('API', c_yellow())} Aku gagal nyambung ke API. Aku pindah ke lokal dulu ya.\n")
+                    sys.stdout.write(f"{c_dim()}(detail: ai \"status\"){c_reset()}\n\n")
+                    sys.stdout.flush()
+                    backend = "local"
+                    label, greet, bye, sys_prompt = persona(backend)
+                    history[0] = {"role": "system", "content": sys_prompt}
+                    continue
+
+            # LOCAL path
+            try:
+                sys.stdout.write(f"{c_dim()}Aku lagi mikir...{c_reset()} ")
+                sys.stdout.flush()
+                spin_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+                stop = threading.Event()
+
+                def spin():
+                    i = 0
+                    while not stop.is_set():
+                        sys.stdout.write(spin_frames[i % len(spin_frames)])
+                        sys.stdout.flush()
+                        time.sleep(0.08)
+                        sys.stdout.write("\b")
+                        i += 1
+
+                th = threading.Thread(target=spin, daemon=True)
+                th.start()
+
+                host = ollama_host(cfg)
+                m = local_model_for(cfg, "ask") or "llama3.1:8b"
+                tok = local_tokens_for_chat(user)
+                answer = ollama_chat(host, m, history, timeout=260, num_predict=tok)
+                stop.set()
+                th.join(timeout=1)
+                sys.stdout.write(f"{c_green()}✅{c_reset()}\n")
+                sys.stdout.flush()
+
+                flush_stdin()
+                history.append({"role": "assistant", "content": answer})
+                sys.stdout.write(f"{c_dim()}────────────────────────────────────────{c_reset()}\n")
+                sys.stdout.write(f"{c_bold()}{label}:{c_reset()} {answer}\n\n")
+                sys.stdout.flush()
+
+            except KeyboardInterrupt:
+                record_last_error("ask_chat", "local", "KeyboardInterrupt saat menunggu LOCAL (chat).")
+                flush_stdin()
+                sys.stdout.write("\n")
+                sys.stdout.write(f"{c_bold()}{label}:{c_reset()} {bye}\n")
+                sys.stdout.flush()
+                break
+            except Exception as ex:
+                record_last_error("ask_chat", "local", str(ex))
+                flush_stdin()
+                sys.stdout.write(f"{tag('LOCAL', c_red())} Aku gagal jawab dari mode lokal.\n")
+                sys.stdout.write(f"{c_dim()}Cek detail lewat: ai \"status\"{c_reset()}\n\n")
+                sys.stdout.flush()
+
+        # Memory ringkas (API chat only)
+        if used_api_at_least_once and mode in ("api", "auto"):
+            ok, _, _ = validate_api_config(cfg)
+            if ok:
+                try:
+                    # Aku ringkas chat saat sesi selesai agar next chat nyambung, tapi tetap hemat token.
+                    # Aku juga “saring” pola yang mirip API key supaya tidak tersimpan.
+                    convo = []
+                    for m in history[-18:]:
+                        r = m.get("role")
+                        c = str(m.get("content") or "")
+                        if not c:
+                            continue
+                        if r == "user":
+                            convo.append(f"User: {c}")
+                        elif r == "assistant":
+                            convo.append(f"Asisten: {c}")
+                    convo_text = "\n".join(convo)
+
+                    summarizer = [
+                        {"role": "system", "content": "Ringkas percakapan menjadi 2–3 kalimat Bahasa Indonesia. Jangan simpan data rahasia/credential."},
+                        {"role": "user", "content": convo_text},
+                    ]
+                    summary = gemini_generate(cfg, summarizer, timeout=30, max_output_tokens=140)
+                    summary = re.sub(r"(AIza[0-9A-Za-z\-_]+|sk-[0-9A-Za-z]+)", "[REDACTED]", summary)
+                    save_memory(summary, cfg)
+                except Exception as ex:
+                    record_last_error("memory_summary", "api", str(ex))
+
+    finally:
+        cursor_show()
+        alt_screen_exit()
+
+    return 0
+
+
+# ============================================================
+# 14) CMD
+# ============================================================
+
+def mode_cmd(text: str, cfg: dict) -> int:
+    mode = backend_mode(cfg)
+    backend, route = route_for(cfg, "cmd")
+    model = gemini_model_id(cfg) if backend == "api" else (local_model_for(cfg, "cmd") or "(unset)")
+    print_meta_line("CMD", route, model)
+
+    pwd = os.getcwd()
+    mem_ctx = mem_context_text(cfg).strip()
+
+    system_prompt = (
+        "Aku mengubah permintaan user menjadi SATU command Linux yang relevan dan aman.\n"
+        "Aku WAJIB mengembalikan JSON valid saja dengan schema:\n"
+        '{ "purpose": "tujuan singkat", "command": "satu baris", "risk": "risiko singkat" }\n'
+        "- command wajib satu baris.\n"
+        "- risk 1–3 kalimat.\n"
+        f"- Direktori kerja saat ini: {pwd}\n"
+    )
+
+    messages = [{"role": "system", "content": system_prompt}]
+    if mem_ctx:
+        messages.append({"role": "system", "content": mem_ctx})
+    messages.append({"role": "user", "content": text})
+
+    json_schema = {
+        "type": "object",
+        "properties": {
+            "purpose": {"type": "string"},
+            "command": {"type": "string"},
+            "risk": {"type": "string"},
+        },
+        "required": ["purpose", "command", "risk"],
+    }
+
+    def parse_obj(raw: str) -> tuple[str, str, str]:
+        obj = json.loads(raw)
+        return (
+            str(obj.get("purpose") or "").strip(),
+            str(obj.get("command") or "").strip(),
+            str(obj.get("risk") or "").strip(),
+        )
+
+    def repair_json_once(raw: str, backend_name: str) -> str:
+        # Aku retry 1x kalau model nyeleneh (ini mengurangi “cacat” paling sering).
+        fixer = [
+            {"role": "system", "content": "Kamu HARUS mengeluarkan JSON valid saja. Tanpa teks lain."},
+            {"role": "user", "content": f"Perbaiki output ini menjadi JSON valid sesuai schema (jangan ubah makna):\n{raw}"},
+        ]
+        if backend_name == "api":
+            return gemini_generate(cfg, fixer, timeout=30, max_output_tokens=220, json_schema=json_schema)
+        host = ollama_host(cfg)
+        m = local_model_for(cfg, "cmd") or "llama3.1:8b"
+        return ollama_chat(host, m, fixer, timeout=60, num_predict=72)
+
+    flush_stdin()
+
+    # API path
+    if backend == "api":
+        ok, note, detail = validate_api_config(cfg)
+        if not ok:
+            record_last_error("cmd", "api", f"{note}\n{detail}")
+            if mode == "api":
+                print_brief_error(note)
+            backend = "local"
+        else:
+            try:
+                with Spinner("Aku lagi nyari command terbaik..."):
+                    raw = gemini_generate(cfg, messages, timeout=70, max_output_tokens=420, json_schema=json_schema)
+                flush_stdin()
+                try:
+                    purpose, cmd, risk = parse_obj(raw)
+                except Exception:
+                    raw2 = repair_json_once(raw, "api")
+                    purpose, cmd, risk = parse_obj(raw2)
+                return render_cmd_flow(cmd, risk, purpose)
+            except KeyboardInterrupt:
+                record_last_error("cmd", "api", "KeyboardInterrupt saat menunggu API (cmd).")
+                flush_stdin()
+                print_brief_error("Dibatalkan")
+                return 130
+            except Exception as ex:
+                record_last_error("cmd", "api", str(ex))
+                flush_stdin()
+                print_info(f"{tag('AUTO', c_yellow())} -> {tag('LOCAL', c_green())} • {local_model_for(cfg,'cmd') or '(unset)'}")
+                backend = "local"
+
+    # LOCAL path
+    try:
+        host = ollama_host(cfg)
+        m = local_model_for(cfg, "cmd") or "llama3.1:8b"
+        tok = local_tokens_for_cmd()
+        with Spinner("Aku lagi nyari command terbaik..."):
+            raw = ollama_chat(host, m, messages, timeout=140, num_predict=tok)
+        flush_stdin()
+        try:
+            purpose, cmd, risk = parse_obj(raw)
+        except Exception:
+            raw2 = repair_json_once(raw, "local")
+            purpose, cmd, risk = parse_obj(raw2)
+        return render_cmd_flow(cmd, risk, purpose)
+    except KeyboardInterrupt:
+        record_last_error("cmd", "local", "KeyboardInterrupt saat menunggu LOCAL (cmd).")
+        flush_stdin()
+        print_brief_error("Dibatalkan")
+        return 130
+    except Exception as ex:
+        record_last_error("cmd", "local", str(ex))
+        flush_stdin()
+        print_brief_error("Mode lokal juga gagal")
+        return 2
+
+
+def render_cmd_flow(cmd: str, risk: str, purpose: str) -> int:
+    cols, _ = term_size()
+
+    if is_denied(cmd):
+        sys.stdout.write(f"{tag('BLOCKED', c_red())} Aku blokir perintah ini karena terdeteksi berbahaya.\n")
+        sys.stdout.flush()
+        return 3
+
+    if purpose:
+        sys.stdout.write(f"{c_bold()}Tujuan:{c_reset()} {wrap(purpose, width=min(cols, 120))}\n")
+    sys.stdout.write(f"{c_bold()}Command:{c_reset()} {cmd}\n")
+    sys.stdout.write(f"{c_bold()}Risiko:{c_reset()} {wrap(risk or 'Risiko tidak dijelaskan.', width=min(cols, 120))}\n")
+    sys.stdout.flush()
+
+    if "sudo" in cmd.split():
+        if not confirm("🔐 Command ini pakai sudo. Tetap lanjut? [y/N]: "):
+            if copy_to_clipboard(cmd):
+                print_info("Command aku salin ke clipboard.")
+            sys.stdout.write(f"{tag('CANCEL', c_yellow())} Aku batalin.\n")
+            sys.stdout.flush()
+            return 0
+
+    if confirm("⚠️  Jalankan command ini? [y/N]: "):
+        rc = run_command(cmd)
+        sys.stdout.write(f"{tag('DONE', c_green())} Selesai. Exit code: {rc}\n")
+        sys.stdout.flush()
+        return rc
+
+    if copy_to_clipboard(cmd):
+        print_info("Command aku salin ke clipboard.")
+    sys.stdout.write(f"{tag('CANCEL', c_yellow())} Aku batalin. Command tidak dijalankan.\n")
+    sys.stdout.flush()
+    return 0
+
+
+# ============================================================
+# 15) AI status (debug center)
+# ============================================================
+
+def ai_status(cfg: dict) -> int:
+    cols, _ = term_size()
+
+    def h(title: str) -> None:
+        sys.stdout.write(f"\n{tag(title, c_cyan())}\n")
+        sys.stdout.flush()
+
+    def kv(k: str, v: str) -> None:
+        sys.stdout.write(wrap(f"- {k:<16}: {v}", width=min(cols, 120)) + "\n")
+        sys.stdout.flush()
+
+    # 1) paths
+    h("1) Lokasi file & folder")
+    kv("Logic", str(LOGIC_PATH))
+    kv("Config", str(CONFIG_PATH))
+    kv("Memory", str(MEMORY_PATH))
+    kv("Last error", str(LAST_ERROR_PATH))
+    kv("Fish config", str(FISH_DIR))
+    kv("Fish funcs", str(FISH_FUNCS_DIR))
+
+    # 2) settings
+    h("2) Setting aktif")
+    kv("backend_mode", backend_mode(cfg))
+    kv("api.provider", api_provider(cfg))
+    kv("api.model", api_active_model_raw(cfg) or "(kosong)")
+    kv("local.ask", local_model_for(cfg, "ask") or "(kosong)")
+    kv("local.cmd", local_model_for(cfg, "cmd") or "(kosong)")
+
+    # UI deps
+    h("2.1) UI dependency (opsional)")
+    try:
+        import prompt_toolkit  # type: ignore  # noqa: F401
+
+        kv("prompt_toolkit", "TERPASANG ✅ (input editor lebih enak)")
+    except Exception:
+        kv("prompt_toolkit", "BELUM ✅ (fallback mode biasa)")
+        kv("saran dnf", "sudo dnf install -y python3-prompt-toolkit")
+
+    # 3) local readiness
+    h("3) Kesiapan LOCAL (Ollama) — rinci")
+    local = local_ready_deep(cfg)
+    kv("status", "READY ✅" if local["ok"] else "NOT READY ❌")
+    kv("catatan", local["catatan"])
+    kv("detail", local["detail"])
+    if local.get("langkah"):
+        sys.stdout.write("  Langkah yang bisa dicoba:\n")
+        for s in local["langkah"]:
+            sys.stdout.write(f"   - {s}\n")
+        sys.stdout.flush()
+
+    sys.stdout.write("\n  Model terdeteksi:\n")
+    if local.get("models"):
+        for m in local["models"]:
+            sys.stdout.write(f"   - {m}\n")
+    else:
+        sys.stdout.write("   - (tidak ada)\n")
+    sys.stdout.flush()
+
+    # 4) API readiness
+    h("4) Kesiapan API (Gemini) — rinci")
+    key, env_name = gemini_key(cfg)
+    ok_api, note_api, detail_api = validate_api_config(cfg)
+    kv("env var", f"{env_name} (terdeteksi: {'YA ✅' if key else 'TIDAK ❌'})")
+    kv("status", "READY ✅" if ok_api else "NOT READY ❌")
+    kv("catatan", note_api)
+    kv("detail", detail_api)
+
+    if ok_api:
+        ok_ping, ping_detail = api_selftest(cfg)
+        kv("self-test", "PASS ✅" if ok_ping else "FAIL ❌")
+        kv("self-test detail", ping_detail)
+        if not ok_ping:
+            sys.stdout.write("  Langkah yang bisa dicoba:\n")
+            sys.stdout.write("   - Pastikan API key benar dan tidak dibatasi restriction.\n")
+            sys.stdout.write("   - Pastikan model bisa dipakai oleh key ini.\n")
+            sys.stdout.write("   - Coba ganti model ke gemini-2.0-flash untuk ngetes.\n")
+            sys.stdout.flush()
+    else:
+        # Langkah praktis khusus fish env (kasus yang sering kejadian)
+        if not key:
+            sys.stdout.write("  Langkah yang bisa dicoba:\n")
+            sys.stdout.write("   - Pastikan GEMINI_API_KEY benar-benar punya value (bukan kosong).\n")
+            sys.stdout.write("   - Di fish, format yang benar: set -gx GEMINI_API_KEY \"ISI_KEY\"\n")
+            sys.stdout.write("   - Pastikan secrets.fish di-source oleh ~/.config/fish/config.fish\n")
+            sys.stdout.flush()
+
+    # 5) runtime conclusion
+    h("5) Kesimpulan mode runtime")
+    mode = backend_mode(cfg)
+    if mode == "local":
+        msg = "✅ Mode LOCAL aktif. Sili siap dipakai. Kalau lambat, coba model yang lebih ringan."
+        if not local["ok"]:
+            msg = "❌ Mode LOCAL aktif, tapi LOCAL belum siap. Perbaiki Ollama dulu ya."
+        sys.stdout.write(wrap(msg, width=min(cols, 120)) + "\n")
+    elif mode == "auto":
+        if ok_api:
+            sys.stdout.write(wrap("✨ AUTO akan memakai API (siap). Kalau API error di runtime, aku fallback ke LOCAL.", width=min(cols, 120)) + "\n")
+        elif local["ok"]:
+            sys.stdout.write(wrap("🙂 AUTO fallback ke LOCAL karena API belum siap. Tenang, fitur tetap jalan.", width=min(cols, 120)) + "\n")
+        else:
+            sys.stdout.write(wrap("⚠️ AUTO tidak menemukan backend siap (API & LOCAL sama-sama belum siap).", width=min(cols, 120)) + "\n")
+    else:  # api
+        if ok_api:
+            sys.stdout.write(wrap("💎 Mode API aktif. Kalau API error di runtime, aku fallback ke LOCAL supaya tool tetap jalan.", width=min(cols, 120)) + "\n")
+        elif local["ok"]:
+            sys.stdout.write(wrap("⚠️ Mode API aktif, tapi API belum siap. Runtime akan fallback ke LOCAL.", width=min(cols, 120)) + "\n")
+        else:
+            sys.stdout.write(wrap("❌ API tidak siap dan LOCAL juga tidak siap. Ini perlu dibenerin dulu.", width=min(cols, 120)) + "\n")
+    sys.stdout.flush()
+
+    # 6) last error (detail + langkah)
+    h("6) Last error (detail + langkah)")
+    last = read_last_error()
+    if not last:
+        sys.stdout.write(wrap("Tidak ada error terakhir yang tercatat. (aman)", width=min(cols, 120)) + "\n")
+    else:
+        kv("time", str(last.get("time")))
+        kv("stage", str(last.get("stage")))
+        kv("backend", str(last.get("backend")))
+        sys.stdout.write("  Detail:\n")
+        sys.stdout.write(wrap(str(last.get("detail") or ""), width=min(cols, 120)) + "\n")
+        sys.stdout.write("\n  Langkah cepat yang biasanya membantu:\n")
+        sys.stdout.write("   - Jalankan ulang `ai \"status\"` setelah kamu memperbaiki config/env.\n")
+        sys.stdout.write("   - Kalau error LOCAL: cek Ollama hidup + model ringan.\n")
+        sys.stdout.write("   - Kalau error API: cek env key + provider/model cocok.\n")
+        sys.stdout.flush()
+
+    # 7) open action
+    h("7) Aksi (opsional) — buka file/folder")
+    sys.stdout.write("Pilih salah satu:\n")
+    sys.stdout.write("  - all     : buka logic + config + folder fish\n")
+    sys.stdout.write("  - base    : buka logic + config\n")
+    sys.stdout.write("  - ai-term : buka logic saja\n")
+    sys.stdout.write("  - config  : buka config.json\n")
+    sys.stdout.write("  - memory  : buka memory.json\n")
+    sys.stdout.write("  - error   : buka last_error.json\n")
+    sys.stdout.write("  - fish    : buka folder fish\n")
+    sys.stdout.write("  - funcs   : buka folder fish functions\n")
+    sys.stdout.write("  - (enter) : lewati\n")
+    sys.stdout.flush()
+
+    try:
+        ans = prompt_text("> ").strip().lower()
+    except KeyboardInterrupt:
+        sys.stdout.write("\n")
+        return 0
+
+    if not ans:
+        return 0
+
+    code_path = which("code")
+    if not code_path:
+        print_info("Perintah 'code' tidak ada di PATH. Aktifkan VS Code CLI dulu kalau kamu mau auto-open.")
+        return 0
+
+    def open_code(path: Path) -> None:
+        subprocess.Popen([code_path, str(path)])
+
+    try:
+        if ans == "all":
+            open_code(LOGIC_PATH)
+            open_code(CONFIG_PATH)
+            open_code(FISH_DIR)
+        elif ans == "base":
+            open_code(LOGIC_PATH)
+            open_code(CONFIG_PATH)
+        elif ans in ("ai-term", "logic"):
+            open_code(LOGIC_PATH)
+        elif ans == "config":
+            open_code(CONFIG_PATH)
+        elif ans == "memory":
+            open_code(MEMORY_PATH)
+        elif ans == "error":
+            open_code(LAST_ERROR_PATH)
+        elif ans == "fish":
+            open_code(FISH_DIR)
+        elif ans == "funcs":
+            open_code(FISH_FUNCS_DIR)
+        else:
+            print_info("Pilihan tidak dikenal.")
+    except Exception as ex:
+        record_last_error("ai_status_open", "local", str(ex))
+        print_brief_error(f"Gagal membuka VS Code: {ex}")
+
+    return 0
+
+
+def mode_ai(text: str, cfg: dict) -> int:
+    t = text.strip().lower()
+    if t in ("status", "buka file konfigurasi"):
+        return ai_status(cfg)
+    print('Gunakan: ai "status"')
+    return 2
+
+
+# ============================================================
+# 16) Main entry
+# ============================================================
+
+def main() -> int:
+    if len(sys.argv) < 3:
+        print("Format penggunaan:")
+        print('  ask "..."')
+        print('  cmd "..."')
+        print('  ai "status"')
+        return 2
+
+    mode = sys.argv[1].strip().lower()
+    text = " ".join(sys.argv[2:]).strip()
+    cfg = load_config()
+
+    if mode == "ask":
+        return mode_ask(text, cfg)
+    if mode == "cmd":
+        return mode_cmd(text, cfg)
+    if mode == "ai":
+        return mode_ai(text, cfg)
+
+    print("Mode tidak dikenal. Pakai: ask / cmd / ai.")
+    return 2
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main())
+    except KeyboardInterrupt:
+        print("\nDibatalkan oleh pengguna.")
+        raise SystemExit(130)

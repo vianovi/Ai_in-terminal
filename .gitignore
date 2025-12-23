@@ -1,0 +1,16 @@
+# runtime & secrets
+memory.json
+last_error.json
+secrets.fish
+*.env
+*.key
+
+# python
+__pycache__/
+*.pyc
+
+# editor
+.vscode/
+
+# workspace
+workspace/
