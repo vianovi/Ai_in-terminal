@@ -14,3 +14,11 @@ __pycache__/
 
 # workspace
 workspace/
+
+# workspace = file lokal/dev, jangan masuk repo
+/workspace/*.json
+/workspace/*.fish
+
+# python noise
+__pycache__/
+*.pyc
