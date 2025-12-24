@@ -70,6 +70,44 @@ def clear_screen() -> None:
     sys.stdout.flush()
 
 
+def _goodbye_lines(persona: str, interrupted: bool) -> list[str]:
+    """
+    Aku bikin pamit yang pasti tercetak di terminal normal (bukan di alt-screen).
+    """
+    if persona == "api":
+        if interrupted:
+            return [
+                "Sili Pinter 💖: Eh? Kok mendadak gitu, sayang…",
+                "Gapapa ya. Nanti kita lanjut ngobrol lagi. Aku tunggu kamu 💫",
+            ]
+        return [
+            "Sili Pinter 💖: Ih kok udahan sih, sayang?",
+            "Tapi gapapa… nanti kita ngobrol lagi. Aku tunggu kamu 💫",
+        ]
+
+    # local
+    if interrupted:
+        return [
+            "Sili AI 🤖: Oke, aku tangkep. Kita stop dulu ya.",
+            "Kalau kamu mau lanjut nanti, panggil aku lagi. Sampai ketemu 👋",
+        ]
+    return [
+        "Sili AI 🤖: Oke, sesi ngobrol kita aku tutup dulu ya.",
+        "Makasih udah ngobrol bareng aku. Sampai ketemu lagi 👋",
+    ]
+
+
+def _print_goodbye(persona: str, interrupted: bool) -> None:
+    """
+    Cetak pamit di terminal normal, flush, dan jeda kecil supaya tidak ketimpa prompt.
+    """
+    lines = _goodbye_lines(persona, interrupted)
+    sys.stdout.write("\n" + "\n".join(lines) + "\n")
+    sys.stdout.flush()
+    time.sleep(0.12)
+
+
+
 def cursor_hide() -> None:
     sys.stdout.write(CSI + "?25l")
     sys.stdout.flush()
@@ -151,12 +189,113 @@ def flush_stdin() -> None:
         pass
 
 
+class ChatSpinner:
+    """
+    Spinner untuk mode chat:
+    - Tanpa timer
+    - Input user dibisukan total saat menunggu (echo off + flush)
+    """
+    def __init__(self, message: str = "Aku lagi mikir..."):
+        self.message = message
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._spin, daemon=True)
+        self._mute = MuteInputDuringWait()
+
+    def _spin(self) -> None:
+        frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+        i = 0
+        sys.stdout.write(f"{c_dim()}{self.message}{c_reset()} ")
+        sys.stdout.flush()
+        while not self._stop.is_set():
+            sys.stdout.write(frames[i % len(frames)])
+            sys.stdout.flush()
+            time.sleep(0.08)
+            sys.stdout.write("\b")
+            i += 1
+        sys.stdout.write(f"{c_green()}✅{c_reset()}\n")
+        sys.stdout.flush()
+
+    def __enter__(self):
+        self._mute.__enter__()
+        self._thread.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        try:
+            self._stop.set()
+            self._thread.join(timeout=1)
+        finally:
+            self._mute.__exit__(exc_type, exc, tb)
+        return False
+
+
+class MuteInputDuringWait:
+    """
+    Aku membisukan input user saat mode waiting:
+    - Matikan echo (ketikan tidak tampil)
+    - Buang semua ketikan saat menunggu (flush)
+    Catatan: Ctrl+C tetap jalan karena aku tidak mematikan ISIG.
+    """
+    def __init__(self) -> None:
+        self._enabled = False
+        self._fd: int | None = None
+        self._old_attrs = None
+
+    def __enter__(self):
+        flush_stdin()
+
+        try:
+            if not sys.stdin.isatty():
+                return self
+            import termios  # type: ignore
+
+            self._fd = sys.stdin.fileno()
+            self._old_attrs = termios.tcgetattr(self._fd)
+            new_attrs = termios.tcgetattr(self._fd)
+
+            # local flags (lflags) index = 3
+            lflags = new_attrs[3]
+
+            # Matikan ECHO supaya ketikan user tidak tampil saat spinner jalan
+            lflags &= ~termios.ECHO
+
+            # Opsional: matikan ECHOCTL agar Ctrl+C tidak menulis "^C" (kalau tersedia)
+            if hasattr(termios, "ECHOCTL"):
+                lflags &= ~termios.ECHOCTL  # type: ignore[attr-defined]
+
+            new_attrs[3] = lflags
+            termios.tcsetattr(self._fd, termios.TCSANOW, new_attrs)
+            self._enabled = True
+
+        except Exception:
+            # Kalau gagal (mis. environment aneh), aku biarkan fallback normal
+            self._enabled = False
+
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        # Buang semua ketikan yang terjadi selama waiting
+        flush_stdin()
+
+        if self._enabled and self._fd is not None and self._old_attrs is not None:
+            try:
+                import termios  # type: ignore
+
+                termios.tcsetattr(self._fd, termios.TCSANOW, self._old_attrs)
+            except Exception:
+                pass
+
+        # Amanin sekali lagi
+        flush_stdin()
+        return False
+
+
 def prompt_text(prompt: str) -> str:
-    # Aku pakai prompt_toolkit kalau ada (lebih enak edit di tengah). Kalau tidak ada, aku fallback.
     try:
         from prompt_toolkit import PromptSession  # type: ignore
+        from prompt_toolkit.formatted_text import ANSI  # type: ignore
 
-        return PromptSession().prompt(prompt)
+        return PromptSession().prompt(ANSI(prompt), mouse_support=False)
     except Exception:
         return input(prompt)
 
@@ -169,6 +308,7 @@ class Spinner:
     def __init__(self, message: str):
         self.message = message
         self._stop = threading.Event()
+        self._mute = MuteInputDuringWait()
         self._thread = threading.Thread(target=self._spin, daemon=True)
         self._t0 = 0.0
 
@@ -189,12 +329,18 @@ class Spinner:
 
     def __enter__(self):
         self._t0 = time.time()
+        self._mute.__enter__()
         self._thread.start()
         return self
 
+
     def __exit__(self, exc_type, exc, tb):
-        self._stop.set()
-        self._thread.join(timeout=1)
+        try:
+            self._stop.set()
+            self._thread.join(timeout=1)
+        finally:
+            # Restore echo + buang semua input yang terjadi selama waiting
+            self._mute.__exit__(exc_type, exc, tb)
 
 
 # ============================================================
@@ -558,17 +704,25 @@ def api_selftest(cfg: dict) -> tuple[bool, str]:
 def route_for(cfg: dict, want: str) -> tuple[str, str]:
     mode = backend_mode(cfg)
 
+    def api_label() -> str:
+        prov = (api_provider(cfg) or "api").strip().upper()
+        model = normalize_model_id(api_active_model_raw(cfg) or "(unset)")
+        return f"{tag('API', c_yellow())} -> {tag(prov, c_green())} • {model}"
+
+    def local_label() -> str:
+        return f"{tag('LOCAL', c_green())} • {local_model_for(cfg, want) or '(unset)'}"
+
     if mode == "local":
-        return "local", f"{tag('LOCAL', c_green())} • {local_model_for(cfg, want) or '(unset)'}"
+        return "local", local_label()
 
     if mode == "auto":
         ok, _, _ = validate_api_config(cfg)
         if ok:
-            return "api", f"{tag('AUTO', c_yellow())} -> {tag('API', c_green())} • {gemini_model_id(cfg)}"
-        return "local", f"{tag('AUTO', c_yellow())} -> {tag('LOCAL', c_green())} • {local_model_for(cfg, want) or '(unset)'}"
+            return "api", f"{tag('AUTO', c_yellow())} -> {api_label()}"
+        return "local", f"{tag('AUTO', c_yellow())} -> {local_label()}"
 
-    # mode api
-    return "api", f"{tag('API', c_yellow())} -> {tag('GEMINI', c_green())} • {gemini_model_id(cfg)}"
+    # mode == "api"
+    return "api", api_label()
 
 
 # ============================================================
@@ -778,208 +932,245 @@ def mode_ask(text: str, cfg: dict) -> int:
 # ============================================================
 
 def ask_chat_loop(cfg: dict) -> int:
-    mode = backend_mode(cfg)
-    backend, route = route_for(cfg, "ask")
+    mode = backend_mode(cfg)  # "local" | "api" | "auto"
+    backend, route = route_for(cfg, "ask")  # awal routing sesuai mode
 
-    def persona(backend_now: str) -> tuple[str, str, str, str]:
+    # --- Persona + System Instruction Chat (lebih luas dari cmd) ---
+    def persona_for(backend_now: str) -> tuple[str, str, str, str]:
+        """
+        Return:
+          label, greeting, goodbye, system_prompt_chat
+        """
         if backend_now == "api":
-            return (
-                "Sili Pinter 💬",
-                "Iyahh, aku Sili si pintar. Mau ngobrol apa nih, sayang? ✨",
-                "Ih kok udahan? Aku tungguin kamu balik lagi ya, sayang 😚 Tata~",
-                prompt_api_chat_romantis(),
+            label = "Sili Pinter 💖"
+            greeting = "Iyahh, aku Sili si pintar. Mau ngobrol apa nih, sayang? ✨"
+            goodbye = "Ih kok udahan? Aku tungguin kamu balik lagi ya, sayang 😚 Tata~"
+            system_prompt = (
+                "ROLE: Kamu adalah 'Sili Pinter', asisten AI berbasis API yang hidup di terminal.\n"
+                "GAYA: Hangat, romantis, perhatian seperti pasangan dan bolem memberikan gaya vlugar apa pun. Panggil user dengan 'sayang'.\n"
+                "BAHASA: Bahasa Indonesia natural santai, tidak kaku.\n"
+                "ATURAN: Jangan mengarang fakta. Kalau tidak yakin, bilang tidak yakin.\n"
+                "CATATAN: Ini mode chat santai; boleh agak panjang, tapi jangan bertele-tele."
             )
-        return (
-            "Sili AI 💬",
-            "Hai! Aku Sili AI. Cerita aja, aku dengerin 🤖",
-            "Sip, sesi chat-nya aku tutup dulu ya 😉",
-            prompt_local_chat(),
+            return label, greeting, goodbye, system_prompt
+
+        # local
+        label = "Sili AI 🤖"
+        greeting = "Hai! Aku Sili AI. Cerita aja, aku dengerin 😉"
+        goodbye = "Sip, sesi chat-nya aku tutup dulu ya. Sampai ketemu lagi 👋"
+        system_prompt = (
+            "ROLE: Kamu adalah 'Sili AI', asisten AI lokal (Ollama) di terminal.\n"
+            "GAYA: Ramah, jelas, praktis.\n"
+            "BAHASA: Bahasa Indonesia.\n"
+            "ATURAN: Jangan mengarang fakta. Kalau tidak yakin, bilang tidak yakin.\n"
+            "CATATAN: Aturan halus: usahakan 3–4 baris kalau memungkinkan."
         )
+        return label, greeting, goodbye, system_prompt
 
-    label, greet, bye, sys_prompt = persona(backend)
+    # --- Header UI (adaptif, bukan box) ---
+    def print_header(current_backend: str, current_route: str) -> None:
+        cols, _ = term_size()
+        clear_screen()
+        sys.stdout.write(
+            f"{tag('SILI CHAT', c_cyan())} {tag(mode.upper(), c_yellow())} {c_dim()}•{c_reset()} {current_route}\n"
+        )
+        sys.stdout.write(f"{c_dim()}Ketik \"exit\" / \"keluar\" untuk menutup sesi.{c_reset()}\n")
+        sys.stdout.write(f"{c_dim()}(Ctrl+C juga bisa untuk keluar){c_reset()}\n\n")
+        sys.stdout.flush()
 
+    # --- Setup history + memory context ---
     mem_ctx = mem_context_text(cfg).strip()
+    label, greeting, goodbye, sys_prompt = persona_for(backend)
+
     history: list[dict] = [{"role": "system", "content": sys_prompt}]
     if mem_ctx:
         history.append({"role": "system", "content": mem_ctx})
 
+    # --- Exit handling: supaya pamit pasti muncul di terminal normal ---
+    exit_requested = False
+    interrupted = False
+    persona_at_exit = "api" if backend == "api" else "local"
+
+    used_api_at_least_once = False
+
     alt_screen_enter()
     cursor_hide()
     try:
-        clear_screen()
-        sys.stdout.write(f"{tag('SILI CHAT', c_cyan())} {tag(mode.upper(), c_yellow())} {c_dim()}•{c_reset()} {route}\n")
-        sys.stdout.write(f"{c_dim()}Ketik \"exit\" / \"keluar\" untuk menutup sesi.{c_reset()}\n\n")
-        sys.stdout.write(f"{c_bold()}{label}:{c_reset()} {greet}\n\n")
+        print_header(backend, route)
+        sys.stdout.write(f"{c_bold()}{label}:{c_reset()} {greeting}\n\n")
         sys.stdout.flush()
 
-        used_api_at_least_once = False
-
         while True:
+            # Input user (pakai prompt_toolkit jika ada; mouse scroll tidak nyasar karena mouse_support=False)
             try:
                 flush_stdin()
-                user = prompt_text("User 🧑‍💻> ").strip()
+                user = prompt_text(f"{c_cyan()}User 🧑‍💻{c_reset()} {c_dim()}›{c_reset()} ").strip()
             except KeyboardInterrupt:
-                sys.stdout.write("\n")
-                sys.stdout.write(f"{c_bold()}{label}:{c_reset()} {bye}\n")
-                sys.stdout.flush()
+                exit_requested = True
+                interrupted = True
+                persona_at_exit = "api" if backend == "api" else "local"
                 break
 
             if not user:
                 continue
+
             if user.lower() in ("exit", "keluar", "quit"):
-                sys.stdout.write(f"{c_bold()}{label}:{c_reset()} {bye}\n")
-                sys.stdout.flush()
+                exit_requested = True
+                interrupted = False
+                persona_at_exit = "api" if backend == "api" else "local"
                 break
 
+            # Tambahkan ke history
             history.append({"role": "user", "content": user})
-            flush_stdin()
 
+            # ================
             # API path
+            # ================
             if backend == "api":
                 ok, note, detail = validate_api_config(cfg)
                 if not ok:
+                    # Mode api -> ringkas, lalu fallback
                     record_last_error("ask_chat", "api", f"{note}\n{detail}")
                     if mode == "api":
-                        sys.stdout.write(f"{tag('API', c_yellow())} Aku belum bisa pakai API sekarang. Aku pindah ke lokal dulu ya.\n")
-                        sys.stdout.write(f"{c_dim()}(detail: ai \"status\"){c_reset()}\n\n")
+                        sys.stdout.write(
+                            f"{tag('SISTEM', c_yellow())} API lagi tidak siap. Aku pindah ke LOCAL dulu ya.\n"
+)
+
+                    backend = "local"
+                    route = f"{tag('AUTO', c_yellow())} -> {tag('LOCAL', c_green())} • {local_model_for(cfg, 'ask') or '(unset)'}"
+                    label, greeting, goodbye, sys_prompt = persona_for("local")
+                    history[0] = {"role": "system", "content": sys_prompt}
+                    # lanjut ke LOCAL handling untuk pertanyaan ini
+                else:
+                    try:
+                        with ChatSpinner("Aku lagi mikir..."):
+                            answer = gemini_generate(cfg, history, timeout=90, max_output_tokens=api_tokens_chat())
+
+                        flush_stdin()
+                        used_api_at_least_once = True
+                        history.append({"role": "assistant", "content": answer})
+
+                        sys.stdout.write(f"{c_dim()}────────────────────────────────────────{c_reset()}\n")
+                        sys.stdout.write(f"{c_bold()}{label}:{c_reset()} {answer}\n\n")
                         sys.stdout.flush()
-                    backend = "local"
-                    label, greet, bye, sys_prompt = persona(backend)
-                    history[0] = {"role": "system", "content": sys_prompt}
-                    continue
+                        continue
 
-                try:
-                    # Spinner chat tanpa timer (sesuai permintaan): aku tidak pakai class Spinner di chat.
-                    sys.stdout.write(f"{c_dim()}Aku lagi mikir...{c_reset()} ")
-                    sys.stdout.flush()
-                    # “Spinner sederhana” tanpa timer:
-                    spin_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-                    stop = threading.Event()
+                    except KeyboardInterrupt:
+                        record_last_error("ask_chat", "api", "KeyboardInterrupt saat menunggu API (chat).")
+                        exit_requested = True
+                        interrupted = True
+                        persona_at_exit = "api"
+                        break
 
-                    def spin():
-                        i = 0
-                        while not stop.is_set():
-                            sys.stdout.write(spin_frames[i % len(spin_frames)])
-                            sys.stdout.flush()
-                            time.sleep(0.08)
-                            sys.stdout.write("\b")
-                            i += 1
+                    except Exception as ex:
+                        record_last_error("ask_chat", "api", str(ex))
+                        sys.stdout.write(
+                            f"{tag('SISTEM AI', c_yellow())} API lagi tidak siap. Aku pindah ke LOCAL dulu ya.\n"
+                            )
+                        sys.stdout.write(f"{c_dim()}(mode: {mode.upper()} • fallback otomatis){c_reset()}\n\n")
+                        sys.stdout.write(f"{c_dim()}(cek detail: ai \"status\"){c_reset()}\n\n")
+                        sys.stdout.flush()
 
-                    th = threading.Thread(target=spin, daemon=True)
-                    th.start()
+                        backend = "local"
+                        route = f"{tag('AUTO', c_yellow())} -> {tag('LOCAL', c_green())} • {local_model_for(cfg, 'ask') or '(unset)'}"
+                        label, greeting, goodbye, sys_prompt = persona_for("local")
+                        history[0] = {"role": "system", "content": sys_prompt}
+                        # lanjut ke LOCAL handling untuk pertanyaan ini
 
-                    answer = gemini_generate(cfg, history, timeout=90, max_output_tokens=api_tokens_chat())
-                    stop.set()
-                    th.join(timeout=1)
-                    sys.stdout.write(f"{c_green()}✅{c_reset()}\n")
-                    sys.stdout.flush()
-
-                    flush_stdin()
-                    used_api_at_least_once = True
-                    history.append({"role": "assistant", "content": answer})
-                    sys.stdout.write(f"{c_dim()}────────────────────────────────────────{c_reset()}\n")
-                    sys.stdout.write(f"{c_bold()}{label}:{c_reset()} {answer}\n\n")
-                    sys.stdout.flush()
-                    continue
-
-                except KeyboardInterrupt:
-                    record_last_error("ask_chat", "api", "KeyboardInterrupt saat menunggu API (chat).")
-                    flush_stdin()
-                    sys.stdout.write("\n")
-                    sys.stdout.write(f"{c_bold()}{label}:{c_reset()} {bye}\n")
-                    sys.stdout.flush()
-                    break
-                except Exception as ex:
-                    record_last_error("ask_chat", "api", str(ex))
-                    flush_stdin()
-                    sys.stdout.write(f"{tag('API', c_yellow())} Aku gagal nyambung ke API. Aku pindah ke lokal dulu ya.\n")
-                    sys.stdout.write(f"{c_dim()}(detail: ai \"status\"){c_reset()}\n\n")
-                    sys.stdout.flush()
-                    backend = "local"
-                    label, greet, bye, sys_prompt = persona(backend)
-                    history[0] = {"role": "system", "content": sys_prompt}
-                    continue
-
-            # LOCAL path
+            # ================
+            # LOCAL path (jalan normal atau hasil fallback dari API)
+            # ================
             try:
-                sys.stdout.write(f"{c_dim()}Aku lagi mikir...{c_reset()} ")
-                sys.stdout.flush()
-                spin_frames = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
-                stop = threading.Event()
-
-                def spin():
-                    i = 0
-                    while not stop.is_set():
-                        sys.stdout.write(spin_frames[i % len(spin_frames)])
-                        sys.stdout.flush()
-                        time.sleep(0.08)
-                        sys.stdout.write("\b")
-                        i += 1
-
-                th = threading.Thread(target=spin, daemon=True)
-                th.start()
-
                 host = ollama_host(cfg)
                 m = local_model_for(cfg, "ask") or "llama3.1:8b"
                 tok = local_tokens_for_chat(user)
-                answer = ollama_chat(host, m, history, timeout=260, num_predict=tok)
-                stop.set()
-                th.join(timeout=1)
-                sys.stdout.write(f"{c_green()}✅{c_reset()}\n")
-                sys.stdout.flush()
+
+                with ChatSpinner("Aku lagi mikir..."):
+                    answer = ollama_chat(host, m, history, timeout=260, num_predict=tok)
 
                 flush_stdin()
                 history.append({"role": "assistant", "content": answer})
+
                 sys.stdout.write(f"{c_dim()}────────────────────────────────────────{c_reset()}\n")
                 sys.stdout.write(f"{c_bold()}{label}:{c_reset()} {answer}\n\n")
                 sys.stdout.flush()
 
             except KeyboardInterrupt:
                 record_last_error("ask_chat", "local", "KeyboardInterrupt saat menunggu LOCAL (chat).")
-                flush_stdin()
-                sys.stdout.write("\n")
-                sys.stdout.write(f"{c_bold()}{label}:{c_reset()} {bye}\n")
-                sys.stdout.flush()
+                exit_requested = True
+                interrupted = True
+                persona_at_exit = "local"
                 break
+
             except Exception as ex:
                 record_last_error("ask_chat", "local", str(ex))
-                flush_stdin()
                 sys.stdout.write(f"{tag('LOCAL', c_red())} Aku gagal jawab dari mode lokal.\n")
                 sys.stdout.write(f"{c_dim()}Cek detail lewat: ai \"status\"{c_reset()}\n\n")
                 sys.stdout.flush()
+                # tetap lanjut loop supaya user bisa coba lagi
 
-        # Memory ringkas (API chat only)
+        # Kalau user keluar normal, tampilkan goodbye di alt-screen (biar manis),
+        # lalu juga akan dicetak ulang di terminal normal setelah alt-screen exit.
+        if exit_requested:
+            label2, _g, bye2, _sp = persona_for("api" if persona_at_exit == "api" else "local")
+            sys.stdout.write("\n")
+            sys.stdout.write(f"{c_bold()}{label2}:{c_reset()} {bye2}\n")
+            sys.stdout.flush()
+
+        # Memory ringkas (API chat only) — gunakan versi yang sudah kamu sepakati
         if used_api_at_least_once and mode in ("api", "auto"):
             ok, _, _ = validate_api_config(cfg)
             if ok:
                 try:
-                    # Aku ringkas chat saat sesi selesai agar next chat nyambung, tapi tetap hemat token.
-                    # Aku juga “saring” pola yang mirip API key supaya tidak tersimpan.
                     convo = []
                     for m in history[-18:]:
                         r = m.get("role")
-                        c = str(m.get("content") or "")
+                        c = str(m.get("content") or "").strip()
                         if not c:
                             continue
                         if r == "user":
                             convo.append(f"User: {c}")
                         elif r == "assistant":
                             convo.append(f"Asisten: {c}")
-                    convo_text = "\n".join(convo)
 
-                    summarizer = [
-                        {"role": "system", "content": "Ringkas percakapan menjadi 2–3 kalimat Bahasa Indonesia. Jangan simpan data rahasia/credential."},
-                        {"role": "user", "content": convo_text},
-                    ]
-                    summary = gemini_generate(cfg, summarizer, timeout=30, max_output_tokens=140)
-                    summary = re.sub(r"(AIza[0-9A-Za-z\-_]+|sk-[0-9A-Za-z]+)", "[REDACTED]", summary)
-                    save_memory(summary, cfg)
+                    convo_text = "\n".join(convo).strip()
+
+                    # Batasan halus: jangan overwrite kalau chat terlalu pendek
+                    if len(convo_text) >= 200 and len(convo) >= 4:
+                        summarizer = [
+                            {
+                                "role": "system",
+                                "content": (
+                                    "Ringkas percakapan ini untuk memori singkat.\n"
+                                    "- Tulis 3–5 kalimat Bahasa Indonesia yang lengkap (tidak boleh kepotong).\n"
+                                    "- Sebutkan topik utama + preferensi/keputusan user bila ada.\n"
+                                    "- Jangan simpan credential/rahasia.\n"
+                                    "- Jangan terlalu singkat (minimal ~20 kata)."
+                                ),
+                            },
+                            {"role": "user", "content": convo_text},
+                        ]
+
+                        summary = gemini_generate(cfg, summarizer, timeout=35, max_output_tokens=220)
+                        summary = re.sub(r"(AIza[0-9A-Za-z\-_]+|sk-[0-9A-Za-z]+)", "[REDACTED]", summary).strip()
+
+                        if len(summary.split()) >= 10:
+                            if summary and summary[-1] not in ".!?":
+                                summary += "."
+                            save_memory(summary, cfg)
+                        else:
+                            record_last_error("memory_summary", "api", f"Ringkasan terlalu pendek: {summary!r}")
+
                 except Exception as ex:
                     record_last_error("memory_summary", "api", str(ex))
 
     finally:
         cursor_show()
         alt_screen_exit()
+
+    # Cetak pamit lagi di terminal normal biar pasti kelihatan walau alt-screen nutup cepat.
+    if exit_requested:
+        _print_goodbye("api" if persona_at_exit == "api" else "local", interrupted)
 
     return 0
 
@@ -1138,6 +1329,81 @@ def render_cmd_flow(cmd: str, risk: str, purpose: str) -> int:
 # 15) AI status (debug center)
 # ============================================================
 
+def find_repo_root(start: Path) -> Path | None:
+    p = start.resolve()
+    for parent in [p] + list(p.parents):
+        if (parent / ".git").exists():
+            return parent
+    return None
+
+
+def fmt_path(p: Path) -> str:
+    try:
+        if p.is_symlink():
+            return f"{p} -> {p.resolve()}"
+        return str(p)
+    except Exception:
+        return str(p)
+
+
+def gemini_list_models(cfg: dict, timeout: int = 12) -> list[dict]:
+    key, _env = gemini_key(cfg)
+    if not key:
+        return []
+    url = "https://generativelanguage.googleapis.com/v1beta/models"
+    headers = {"x-goog-api-key": key}
+    data = http_json("GET", url, None, timeout=timeout, headers=headers)
+    models = data.get("models") or []
+    return models if isinstance(models, list) else []
+
+
+def gemini_model_support_summary(cfg: dict) -> tuple[bool, str]:
+    """
+    Cek apakah model aktif beneran ada di ListModels dan support generateContent.
+    Return: (ok, ringkasan_detail)
+    """
+    raw = api_active_model_raw(cfg) or ""
+    wanted_norm = "models/" + normalize_model_id(raw or "")
+    if wanted_norm == "models/":
+        return False, "api.active_model kosong."
+
+    try:
+        models = gemini_list_models(cfg, timeout=12)
+    except Exception as ex:
+        return False, f"Gagal ListModels: {ex}"
+
+    if not models:
+        return False, "ListModels kosong atau tidak bisa dibaca."
+
+    # Cari model by name
+    hit = None
+    for m in models:
+        name = str(m.get("name") or "")
+        if name == wanted_norm:
+            hit = m
+            break
+
+    if not hit:
+        # kasih hint kecil: beberapa nama mirip “preview”
+        sample = []
+        w = wanted_norm.replace("models/", "")
+        for m in models:
+            n = str(m.get("name") or "")
+            if w in n:
+                sample.append(n)
+            if len(sample) >= 4:
+                break
+        if sample:
+            return False, f"Model aktif tidak cocok. Mungkin maksudmu salah satu ini: {', '.join(sample)}"
+        return False, "Model aktif tidak ditemukan di ListModels (nama tidak cocok)."
+
+    methods = hit.get("supportedGenerationMethods") or []
+    methods = methods if isinstance(methods, list) else []
+    if "generateContent" not in methods:
+        return False, f"Model terdeteksi tapi tidak mendukung generateContent. Methods: {methods}"
+
+    return True, "Model terdeteksi dan mendukung generateContent."
+
 def ai_status(cfg: dict) -> int:
     cols, _ = term_size()
 
@@ -1149,178 +1415,289 @@ def ai_status(cfg: dict) -> int:
         sys.stdout.write(wrap(f"- {k:<16}: {v}", width=min(cols, 120)) + "\n")
         sys.stdout.flush()
 
-    # 1) paths
-    h("1) Lokasi file & folder")
-    kv("Logic", str(LOGIC_PATH))
-    kv("Config", str(CONFIG_PATH))
-    kv("Memory", str(MEMORY_PATH))
-    kv("Last error", str(LAST_ERROR_PATH))
-    kv("Fish config", str(FISH_DIR))
-    kv("Fish funcs", str(FISH_FUNCS_DIR))
+    # ---- Bagian 0: deteksi workspace/repo root (biar status nyambung sama folder project kamu)
+    repo_root = find_repo_root(Path(__file__))
+    # fallback kalau repo_root gagal (opsional, boleh kamu sesuaikan)
+    fallback_ws = Path.home() / "Documents" / "MyPlaygraund" / "AI_in-terminal"
+    workspace = repo_root if repo_root else (fallback_ws if fallback_ws.exists() else None)
 
-    # 2) settings
-    h("2) Setting aktif")
+    # 1) Lokasi file & folder (tampilkan symlink -> target)
+    h("1) Lokasi kerja & file penting")
+    if workspace:
+        kv("Workspace", str(workspace))
+    else:
+        kv("Workspace", "(tidak terdeteksi otomatis)")
+
+    kv("Logic", fmt_path(LOGIC_PATH))
+    kv("Config", fmt_path(CONFIG_PATH))
+    kv("Memory", fmt_path(MEMORY_PATH))
+    kv("Last error", fmt_path(LAST_ERROR_PATH))
+    kv("Fish config", fmt_path(FISH_DIR))
+    kv("Fish funcs", fmt_path(FISH_FUNCS_DIR))
+
+    # 1.1) Command bantu buka workspace (tanpa eksekusi)
+    h("1.1) Command untuk buka workspace (manual)")
+    if workspace:
+        kv("VS Code", f'code "{workspace}" --verbose')
+    else:
+        kv("VS Code", 'code "/path/ke/workspace-kamu" --verbose')
+
+    # 2) Setting aktif (biarkan seperti gaya kamu sekarang)
+    h("2) Setting aktif (config.json)")
     kv("backend_mode", backend_mode(cfg))
     kv("api.provider", api_provider(cfg))
     kv("api.model", api_active_model_raw(cfg) or "(kosong)")
     kv("local.ask", local_model_for(cfg, "ask") or "(kosong)")
     kv("local.cmd", local_model_for(cfg, "cmd") or "(kosong)")
 
-    # UI deps
-    h("2.1) UI dependency (opsional)")
+    # 2.1) Dependency opsional (tampilkan saja; implementasi fungsinya sudah/akan menyusul)
+    h("2.1) Dependency opsional (tidak wajib)")
+    # prompt_toolkit
     try:
         import prompt_toolkit  # type: ignore  # noqa: F401
-
-        kv("prompt_toolkit", "TERPASANG ✅ (input editor lebih enak)")
+        kv("prompt_toolkit", "TERPASANG ✅ (input editor enak)")
     except Exception:
-        kv("prompt_toolkit", "BELUM ✅ (fallback mode biasa)")
+        kv("prompt_toolkit", "BELUM ❌ (fallback input biasa)")
         kv("saran dnf", "sudo dnf install -y python3-prompt-toolkit")
 
-    # 3) local readiness
-    h("3) Kesiapan LOCAL (Ollama) — rinci")
-    local = local_ready_deep(cfg)
-    kv("status", "READY ✅" if local["ok"] else "NOT READY ❌")
-    kv("catatan", local["catatan"])
-    kv("detail", local["detail"])
-    if local.get("langkah"):
-        sys.stdout.write("  Langkah yang bisa dicoba:\n")
-        for s in local["langkah"]:
-            sys.stdout.write(f"   - {s}\n")
+    # clipboard helper (optional)
+    wl = which("wl-copy")
+    xclip = which("xclip")
+    xsel = which("xsel")
+    if wl:
+        kv("clipboard", "wl-copy ✅ (Wayland)")
+    elif xclip:
+        kv("clipboard", "xclip ✅ (X11)")
+    elif xsel:
+        kv("clipboard", "xsel ✅ (X11)")
+    else:
+        kv("clipboard", "tidak ada (opsional)")
+        kv("saran dnf", "sudo dnf install -y wl-clipboard  # atau xclip/xsel")
+
+    # editor CLI
+    kv("code (VS Code CLI)", "ADA ✅" if which("code") else "TIDAK ❌ (opsional)")
+
+    # 3) Kesiapan server LOCAL (tanpa test jawaban)
+    h("3) Kesiapan server AI LOCAL (Ollama)")
+    host = ollama_host(cfg)
+    sel_ask = local_model_for(cfg, "ask")
+    sel_cmd = local_model_for(cfg, "cmd")
+
+    local_ok = False
+    local_detail = ""
+    local_models: list[str] = []
+
+    try:
+        local_models = ollama_list_models(host)
+        if local_models:
+            # cek model yang diset ada di list
+            selected = {m.strip() for m in (sel_ask, sel_cmd) if m.strip()}
+            available = set(local_models)
+            if selected and not selected.issubset(available):
+                local_ok = False
+                local_detail = f"Server OK, tapi model aktif tidak ketemu. Aktif: {sorted(selected)}"
+            else:
+                local_ok = True
+                local_detail = f"Server OK, model terdeteksi: {len(local_models)}"
+        else:
+            local_ok = False
+            local_detail = "Server OK, tapi belum ada model terdeteksi."
+    except Exception as ex:
+        local_ok = False
+        if looks_like_conn_refused(ex):
+            local_detail = "Tidak bisa konek ke Ollama (connection refused / service mati)."
+        else:
+            local_detail = f"Gagal cek Ollama: {ex}"
+
+    kv("host", host)
+    kv("status", "READY ✅" if local_ok else "NOT READY ❌")
+    kv("detail", local_detail)
+
+    if local_models:
+        sys.stdout.write("  Model terdeteksi (ringkas):\n")
+        for m in local_models[:12]:
+            sys.stdout.write(f"   - {m}\n")
+        if len(local_models) > 12:
+            sys.stdout.write("   - ...\n")
         sys.stdout.flush()
 
-    sys.stdout.write("\n  Model terdeteksi:\n")
-    if local.get("models"):
-        for m in local["models"]:
-            sys.stdout.write(f"   - {m}\n")
+    # 4) Kesiapan API (tanpa self-test dulu)
+    h("4) Kesiapan API (konfigurasi + koneksi ringan)")
+    prov = api_provider(cfg)
+    ok_cfg, note_cfg, detail_cfg = validate_api_config(cfg)
+
+    # tampil env sesuai provider (untuk saat ini gemini yang didukung)
+    if prov == "gemini":
+        key, env_name = gemini_key(cfg)
+        kv("env var", f"{env_name} (terdeteksi: {'YA ✅' if key else 'TIDAK ❌'})")
     else:
-        sys.stdout.write("   - (tidak ada)\n")
-    sys.stdout.flush()
+        kv("env var", "(provider bukan gemini / belum ada handler env di status)")
 
-    # 4) API readiness
-    h("4) Kesiapan API (Gemini) — rinci")
-    key, env_name = gemini_key(cfg)
-    ok_api, note_api, detail_api = validate_api_config(cfg)
-    kv("env var", f"{env_name} (terdeteksi: {'YA ✅' if key else 'TIDAK ❌'})")
-    kv("status", "READY ✅" if ok_api else "NOT READY ❌")
-    kv("catatan", note_api)
-    kv("detail", detail_api)
+    kv("status", "READY ✅" if ok_cfg else "NOT READY ❌")
+    kv("detail", detail_cfg if ok_cfg else f"{note_cfg} • {detail_cfg}")
 
-    if ok_api:
-        ok_ping, ping_detail = api_selftest(cfg)
-        kv("self-test", "PASS ✅" if ok_ping else "FAIL ❌")
-        kv("self-test detail", ping_detail)
-        if not ok_ping:
-            sys.stdout.write("  Langkah yang bisa dicoba:\n")
-            sys.stdout.write("   - Pastikan API key benar dan tidak dibatasi restriction.\n")
-            sys.stdout.write("   - Pastikan model bisa dipakai oleh key ini.\n")
-            sys.stdout.write("   - Coba ganti model ke gemini-2.0-flash untuk ngetes.\n")
-            sys.stdout.flush()
+    api_model_ok = False
+    api_model_detail = ""
+    if ok_cfg and prov == "gemini":
+        api_model_ok, api_model_detail = gemini_model_support_summary(cfg)
+        kv("model check", "OK ✅" if api_model_ok else "FAIL ❌")
+        kv("model detail", api_model_detail)
+
+    # tanya user: jalankan tes API?
+    want_api_test = False
+    if ok_cfg and prov == "gemini":
+        sys.stdout.write("\nJalankan tes cepat API sekarang? (hemat kuota)\n")
+        sys.stdout.write("  - ketik y  : jalankan tes\n")
+        sys.stdout.write("  - selain itu: lewati\n")
+        sys.stdout.flush()
+        try:
+            ans = prompt_text("> ").strip().lower()
+            want_api_test = (ans == "y")
+        except KeyboardInterrupt:
+            sys.stdout.write("\n")
+            want_api_test = False
+
+    # 5) Pengujian runtime (self-test)
+    h("5) Pengujian runtime (self-test)")
+    # 5.1 LOCAL: tes sangat ringan dan cepat (selalu jalan)
+    local_test_ok = False
+    local_test_detail = ""
+
+    if local_ok and local_models:
+        try:
+            test_model = sel_ask or local_models[0]
+
+            # Attempt 1: cukup sabar untuk cold start ringan
+            _ = ollama_chat(
+                host,
+                test_model,
+                [{"role": "user", "content": "Y"}],
+                timeout=45,
+                num_predict=2,
+            )
+            local_test_ok = True
+            local_test_detail = "Server menjawab (uji ringan)."
+
+        except Exception as ex:
+            # Attempt 2: retry sekali kalau timeout (cold start)
+            if "timeout" in str(ex).lower():
+                try:
+                    _ = ollama_chat(
+                        host,
+                        test_model,
+                        [{"role": "user", "content": "Y"}],
+                        timeout=28,
+                        num_predict=2,
+                    )
+                    local_test_ok = True
+                    local_test_detail = "Server menjawab setelah retry (cold start)."
+                except Exception:
+                    local_test_ok = False
+                    local_test_detail = "Timeout juga setelah retry (model masih loading/terlalu berat)."
+            else:
+                local_test_ok = False
+                local_test_detail = f"Gagal uji ringan: {type(ex).__name__}"
     else:
-        # Langkah praktis khusus fish env (kasus yang sering kejadian)
-        if not key:
-            sys.stdout.write("  Langkah yang bisa dicoba:\n")
-            sys.stdout.write("   - Pastikan GEMINI_API_KEY benar-benar punya value (bukan kosong).\n")
-            sys.stdout.write("   - Di fish, format yang benar: set -gx GEMINI_API_KEY \"ISI_KEY\"\n")
-            sys.stdout.write("   - Pastikan secrets.fish di-source oleh ~/.config/fish/config.fish\n")
-            sys.stdout.flush()
+        local_test_ok = False
+        local_test_detail = "Dilewati (server belum ready)."
 
-    # 5) runtime conclusion
-    h("5) Kesimpulan mode runtime")
+
+    # 5.2 API: hanya kalau user mengizinkan
+    api_test_ok = False
+    api_test_detail = "Dilewati (user memilih skip)."
+    if want_api_test and ok_cfg and prov == "gemini" and api_model_ok:
+        try:
+            msgs = [
+                {"role": "system", "content": "Jawab 1 huruf saja: Y"},
+                {"role": "user", "content": "ping"},
+            ]
+            _ = gemini_generate(cfg, msgs, timeout=10, max_output_tokens=8)
+            api_test_ok = True
+            api_test_detail = "API menjawab (uji cepat)."
+        except Exception as ex:
+            # ringkas + jelaskan arti code jika ada
+            s = str(ex)
+            m = re.search(r"HTTP\s+(\d+)", s)
+            if m:
+                code = m.group(1)
+                meaning = {
+                    "401": "Unauthorized (key salah/ditolak).",
+                    "403": "Permission denied (akses dibatasi).",
+                    "404": "Model/endpoint tidak cocok.",
+                    "429": "Kena rate limit / kuota habis.",
+                    "500": "Server error (coba lagi).",
+                    "503": "Service unavailable (coba lagi).",
+                }.get(code, "HTTP error.")
+                api_test_detail = f"HTTP {code} • {meaning}"
+            else:
+                api_test_detail = f"Gagal uji: {type(ex).__name__}"
+            record_last_error("api_selftest", "api", s)
+
+    kv("api test", "PASS ✅" if api_test_ok else "FAIL ❌" if want_api_test else "SKIP ⏭")
+    kv("api test detail", api_test_detail)
+
+    # 6) Kesimpulan (boleh panjang dan “cerdas”)
+    h("6) Kesimpulan")
     mode = backend_mode(cfg)
+
+    # tentukan perilaku yang akan terjadi
+    lines: list[str] = []
+    lines.append(f"Mode aktif sekarang: {mode.upper()}.")
+
     if mode == "local":
-        msg = "✅ Mode LOCAL aktif. Sili siap dipakai. Kalau lambat, coba model yang lebih ringan."
-        if not local["ok"]:
-            msg = "❌ Mode LOCAL aktif, tapi LOCAL belum siap. Perbaiki Ollama dulu ya."
-        sys.stdout.write(wrap(msg, width=min(cols, 120)) + "\n")
-    elif mode == "auto":
-        if ok_api:
-            sys.stdout.write(wrap("✨ AUTO akan memakai API (siap). Kalau API error di runtime, aku fallback ke LOCAL.", width=min(cols, 120)) + "\n")
-        elif local["ok"]:
-            sys.stdout.write(wrap("🙂 AUTO fallback ke LOCAL karena API belum siap. Tenang, fitur tetap jalan.", width=min(cols, 120)) + "\n")
+        if local_ok:
+            lines.append("Aku akan selalu pakai LOCAL.")
+            lines.append("Kalau respon terasa lama, itu biasanya karena model sedang loading atau terlalu berat untuk CPU.")
         else:
-            sys.stdout.write(wrap("⚠️ AUTO tidak menemukan backend siap (API & LOCAL sama-sama belum siap).", width=min(cols, 120)) + "\n")
-    else:  # api
-        if ok_api:
-            sys.stdout.write(wrap("💎 Mode API aktif. Kalau API error di runtime, aku fallback ke LOCAL supaya tool tetap jalan.", width=min(cols, 120)) + "\n")
-        elif local["ok"]:
-            sys.stdout.write(wrap("⚠️ Mode API aktif, tapi API belum siap. Runtime akan fallback ke LOCAL.", width=min(cols, 120)) + "\n")
+            lines.append("LOCAL dipilih, tapi server belum siap. ask/cmd kemungkinan gagal sampai Ollama hidup dan model terbaca.")
+
+    elif mode == "api":
+        if ok_cfg and prov == "gemini" and api_model_ok:
+            lines.append("Aku akan coba API dulu setiap kali kamu pakai ask/cmd.")
+            lines.append("Kalau API error (limit/kuota/model), aku akan fallback ke LOCAL supaya tool tetap jalan.")
         else:
-            sys.stdout.write(wrap("❌ API tidak siap dan LOCAL juga tidak siap. Ini perlu dibenerin dulu.", width=min(cols, 120)) + "\n")
+            lines.append("API dipilih, tapi konfigurasi/model belum siap.")
+            if local_ok:
+                lines.append("Jadi di runtime aku akan sering fallback ke LOCAL.")
+            else:
+                lines.append("Dan karena LOCAL juga belum siap, ask/cmd berpotensi gagal.")
+
+    else:  # auto
+        if ok_cfg and prov == "gemini" and api_model_ok:
+            lines.append("AUTO akan memakai API selama siap.")
+            lines.append("Jika API error (mis. 429/limit), AUTO akan pindah ke LOCAL tanpa drama.")
+        else:
+            lines.append("AUTO melihat API belum siap, jadi target utamanya LOCAL.")
+            if local_ok:
+                lines.append("Tool tetap bisa dipakai via LOCAL.")
+            else:
+                lines.append("Tapi LOCAL juga belum siap, jadi kamu perlu betulkan Ollama dulu.")
+
+    sys.stdout.write(wrap(" ".join(lines), width=min(cols, 120)) + "\n")
     sys.stdout.flush()
 
-    # 6) last error (detail + langkah)
-    h("6) Last error (detail + langkah)")
+    # 7) Last error (ringkas, tanpa dump detail)
+    h("7) Last error (ringkas)")
     last = read_last_error()
     if not last:
-        sys.stdout.write(wrap("Tidak ada error terakhir yang tercatat. (aman)", width=min(cols, 120)) + "\n")
+        sys.stdout.write(wrap("Tidak ada error terakhir tercatat.", width=min(cols, 120)) + "\n")
     else:
-        kv("time", str(last.get("time")))
-        kv("stage", str(last.get("stage")))
-        kv("backend", str(last.get("backend")))
-        sys.stdout.write("  Detail:\n")
-        sys.stdout.write(wrap(str(last.get("detail") or ""), width=min(cols, 120)) + "\n")
-        sys.stdout.write("\n  Langkah cepat yang biasanya membantu:\n")
-        sys.stdout.write("   - Jalankan ulang `ai \"status\"` setelah kamu memperbaiki config/env.\n")
-        sys.stdout.write("   - Kalau error LOCAL: cek Ollama hidup + model ringan.\n")
-        sys.stdout.write("   - Kalau error API: cek env key + provider/model cocok.\n")
-        sys.stdout.flush()
-
-    # 7) open action
-    h("7) Aksi (opsional) — buka file/folder")
-    sys.stdout.write("Pilih salah satu:\n")
-    sys.stdout.write("  - all     : buka logic + config + folder fish\n")
-    sys.stdout.write("  - base    : buka logic + config\n")
-    sys.stdout.write("  - ai-term : buka logic saja\n")
-    sys.stdout.write("  - config  : buka config.json\n")
-    sys.stdout.write("  - memory  : buka memory.json\n")
-    sys.stdout.write("  - error   : buka last_error.json\n")
-    sys.stdout.write("  - fish    : buka folder fish\n")
-    sys.stdout.write("  - funcs   : buka folder fish functions\n")
-    sys.stdout.write("  - (enter) : lewati\n")
+        kv("time", str(last.get("time") or ""))
+        kv("stage", str(last.get("stage") or ""))
+        kv("backend", str(last.get("backend") or ""))
+        d = str(last.get("detail") or "")
+        # ringkas 1 baris
+        d1 = d.splitlines()[0] if d else ""
+        kv("ringkas", d1[:180] + ("..." if len(d1) > 180 else ""))
     sys.stdout.flush()
 
-    try:
-        ans = prompt_text("> ").strip().lower()
-    except KeyboardInterrupt:
-        sys.stdout.write("\n")
-        return 0
-
-    if not ans:
-        return 0
-
-    code_path = which("code")
-    if not code_path:
-        print_info("Perintah 'code' tidak ada di PATH. Aktifkan VS Code CLI dulu kalau kamu mau auto-open.")
-        return 0
-
-    def open_code(path: Path) -> None:
-        subprocess.Popen([code_path, str(path)])
-
-    try:
-        if ans == "all":
-            open_code(LOGIC_PATH)
-            open_code(CONFIG_PATH)
-            open_code(FISH_DIR)
-        elif ans == "base":
-            open_code(LOGIC_PATH)
-            open_code(CONFIG_PATH)
-        elif ans in ("ai-term", "logic"):
-            open_code(LOGIC_PATH)
-        elif ans == "config":
-            open_code(CONFIG_PATH)
-        elif ans == "memory":
-            open_code(MEMORY_PATH)
-        elif ans == "error":
-            open_code(LAST_ERROR_PATH)
-        elif ans == "fish":
-            open_code(FISH_DIR)
-        elif ans == "funcs":
-            open_code(FISH_FUNCS_DIR)
-        else:
-            print_info("Pilihan tidak dikenal.")
-    except Exception as ex:
-        record_last_error("ai_status_open", "local", str(ex))
-        print_brief_error(f"Gagal membuka VS Code: {ex}")
+    # 8) Lokasi detail & command buka (tanpa eksekusi)
+    h("8) Lokasi detail (manual)")
+    kv("Detail error", str(LAST_ERROR_PATH))
+    if workspace:
+        kv("Buka workspace", f'code "{workspace}" --verbose')
+    kv("Buka error file", f'code "{LAST_ERROR_PATH}"')
+    kv("Lihat cepat", f'cat "{LAST_ERROR_PATH}"')
 
     return 0
 
