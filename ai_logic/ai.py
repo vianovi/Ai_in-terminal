@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 import sys
 from pathlib import Path
 from shutil import which
@@ -42,14 +43,81 @@ from ai_logic.common import (
 
 
 def mode_ai(text: str, cfg: dict) -> int:
-    t = text.strip().lower()
-    if t in ("--help", "help"):
-        print('Gunakan: ai "status"')
-        print('        ai "--help"')
+    raw = (text or "").strip()
+
+    def help_ai() -> int:
+        print('Gunakan:')
+        print('  ai "--help"')
+        print('  ai "status"                (alias cepat)')
+        print('  ai "run status"            (router)')
+        print('  ai "gitx ..."              (stub/akan diisi)')
+        print('  ai "ghx ..."               (stub/akan diisi)')
+        print('  ai "mon ..."               (stub/akan diisi)')
         return 0
-    if t in ("status",):
+
+    # kalau user cuma ketik: ai
+    if not raw:
+        return help_ai()
+
+    # tokenizing aman (support quoted args)
+    try:
+        args = shlex.split(raw)
+    except Exception:
+        # fallback sederhana kalau ada input aneh
+        args = raw.split()
+
+    if not args:
+        return help_ai()
+
+    head = args[0].strip().lower()
+
+    # help
+    if head in ("--help", "-h", "help"):
+        return help_ai()
+
+    # alias backward-compatible
+    if head in ("status", "debug"):
         return ai_status(cfg)
-    print('Gunakan: ai "status"')
+
+    # support gaya "ai:run status" kalau suatu saat kamu bikin alias
+    if head.startswith("ai:"):
+        head = head[3:]
+
+    # subcommand: run
+    if head == "run":
+        if len(args) < 2:
+            print('Gunakan: ai "run status"')
+            return 2
+        sub = args[1].strip().lower()
+
+        if sub in ("status", "debug", "diag", "diagnose"):
+            return ai_status(cfg)
+
+        print(f'Gunakan: ai "run status" (subcommand tidak dikenal: {args[1]!r})')
+        return 2
+
+    # subcommand: gitx / ghx / mon (dispatch ke modul lain, tapi aman kalau belum ada)
+    if head in ("gitx", "ghx", "mon"):
+        rest = args[1:]
+
+        try:
+            if head == "gitx":
+                from ai_logic.gitx import handle_gitx  # type: ignore
+                return int(handle_gitx(rest, cfg))
+            if head == "ghx":
+                from ai_logic.ghx import handle_ghx  # type: ignore
+                return int(handle_ghx(rest, cfg))
+            if head == "mon":
+                from ai_logic.mon import handle_mon  # type: ignore
+                return int(handle_mon(rest, cfg))
+        except ImportError:
+            print(f'Router "{head}" belum diimplementasi. (file ai_logic/{head}.py ada, tapi handler belum ada)')
+            return 0
+        except Exception as ex:
+            print(f'Router "{head}" crash: {type(ex).__name__}: {ex}')
+            return 2
+
+    print('Gunakan: ai "status" atau ai "--help"')
     return 2
 
 
@@ -323,3 +391,7 @@ def ai_status(cfg: dict) -> int:
     kv("Lihat cepat", f'cat "{LAST_ERROR_PATH}"')
 
     return 0
+
+def handle_ai(argv: list[str], cfg: dict) -> int:
+    text = " ".join(argv).strip()
+    return mode_ai(text, cfg)

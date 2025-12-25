@@ -117,6 +117,10 @@ def mode_ask(text: str, cfg: dict) -> int:
         print_brief_error("Mode lokal juga gagal")
         return 2
 
+def handle_ask(argv: list[str], cfg: dict) -> int:
+    # ai-term mengirim argv[2:] berupa list
+    text = " ".join(argv).strip()
+    return mode_ask(text, cfg)
 
 def ask_chat_loop(cfg: dict) -> int:
     mode = backend_mode(cfg)               # "local" | "api" | "auto"

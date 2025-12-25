@@ -146,7 +146,6 @@ def mode_cmd(text: str, cfg: dict) -> int:
         print_brief_error("Mode lokal juga gagal")
         return 2
 
-
 def render_cmd_flow(cmd: str, risk: str, purpose: str) -> int:
     cols = 120
 
@@ -180,3 +179,7 @@ def render_cmd_flow(cmd: str, risk: str, purpose: str) -> int:
     sys.stdout.write(f"{tag('CANCEL', c_yellow())} Aku batalin. Command tidak dijalankan.\n")
     sys.stdout.flush()
     return 0
+
+def handle_cmd(argv: list[str], cfg: dict) -> int:
+    text = " ".join(argv).strip()
+    return mode_cmd(text, cfg)

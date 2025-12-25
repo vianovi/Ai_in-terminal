@@ -4,39 +4,49 @@ from __future__ import annotations
 import sys
 
 from ai_logic.common import load_config
-from ai_logic.ask import mode_ask
-from ai_logic.cmd import mode_cmd
-from ai_logic.ai import mode_ai
+from ai_logic.ask import handle_ask
+from ai_logic.cmd import handle_cmd
+from ai_logic.ai import handle_ai
 
 
-def main() -> int:
-    if len(sys.argv) < 3:
-        print("Format penggunaan:")
-        print('  ask "..."')
-        print('  cmd "..."')
-        print('  ai "status"')
-        print('  ai "--help"')
-        return 2
+def print_usage() -> int:
+    print("Format penggunaan:")
+    print('  ask "..."')
+    print('  ask "hello"    # masuk chat')
+    print('  cmd "..."')
+    print('  ai --help')
+    print('  ai status      # alias ai run status')
+    print('  ai run status')
+    return 2
 
-    mode = sys.argv[1].strip().lower()
-    text = " ".join(sys.argv[2:]).strip()
 
+def main(argv: list[str]) -> int:
+    if len(argv) < 2:
+        return print_usage()
+
+    mode = (argv[1] or "").strip().lower()
     cfg = load_config()
 
     if mode == "ask":
-        return mode_ask(text, cfg)
-    if mode == "cmd":
-        return mode_cmd(text, cfg)
-    if mode == "ai":
-        return mode_ai(text, cfg)
+        if len(argv) < 3:
+            return print_usage()
+        return handle_ask(argv[2:], cfg)
 
-    print("Mode tidak dikenal. Pakai: ask / cmd / ai.")
-    return 2
+    if mode == "cmd":
+        if len(argv) < 3:
+            return print_usage()
+        return handle_cmd(argv[2:], cfg)
+
+    if mode == "ai":
+        # ai boleh dipanggil tanpa arg → tampilkan help
+        return handle_ai(argv[2:], cfg)
+
+    return print_usage()
 
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main())
+        raise SystemExit(main(sys.argv))
     except KeyboardInterrupt:
         print("\nDibatalkan oleh pengguna.")
         raise SystemExit(130)
