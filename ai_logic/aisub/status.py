@@ -1,3 +1,4 @@
+"""Check backend status, connectivity, and configs."""
 from __future__ import annotations
 
 import re
@@ -5,6 +6,7 @@ import sys
 from pathlib import Path
 from shutil import which
 
+# === IMPORT LAMA TETAP AMAN KARENA PAKAI ABSOLUTE PATH ===
 from ai_logic.common import (
     CONFIG_PATH,
     MEMORY_PATH,
@@ -27,15 +29,36 @@ from ai_logic.ui.ansi import (
     c_reset,
 )
 
-from ai_logic.backends.local_ollama import ollama_host, local_model_for, list_models as ollama_list_models, readiness as local_readiness
+from ai_logic.backends.local_ollama import ollama_host, local_model_for, readiness as local_readiness
 from ai_logic.backends.api_gemini import (
     gemini_key,
     validate_api_config,
     model_support_summary,
     generate as gemini_generate,
-    gemini_model_id,
 )
 
+# --- ENTRY POINT BARU: Handle Argv Style ---
+def handle(argv: list[str], cfg: dict) -> int:
+    """
+    Subcommand: ai status [flags]
+    Flags:
+      --last-error / last-error : Tampilkan error log terakhir.
+      --info / info             : Tampilkan info mode singkat.
+      (default)                 : Full status check.
+    """
+    # Deteksi flag di argumen untuk mendukung fitur info/last-error via status subcommand
+    # Contoh: ai status --last-error
+    if any(x in argv for x in ("--last-error", "last-error")):
+        return run_last_error(cfg)
+
+    if any(x in argv for x in ("--info", "info")):
+        return run_info(cfg)
+
+    # Default
+    return run_status(cfg)
+
+
+# --- CODE IMPLEMENTASI ASLI (DIPERTAHANKAN) ---
 
 def _find_repo_root(start: Path) -> Path | None:
     p = start.resolve()
@@ -43,7 +66,6 @@ def _find_repo_root(start: Path) -> Path | None:
         if (parent / ".git").exists():
             return parent
     return None
-
 
 def _fmt_path(p: Path) -> str:
     try:
@@ -53,15 +75,13 @@ def _fmt_path(p: Path) -> str:
     except Exception:
         return str(p)
 
-
 def run_info(cfg: dict) -> int:
     cols, _ = term_size()
     mode = backend_mode(cfg)
     prov = api_provider(cfg)
-    sys.stdout = sys.stdout  # keep mypy calm if used later
+    sys.stdout = sys.stdout  # keep mypy calm
     print(wrap(f"{tag('INFO', c_cyan())} Mode: {mode.upper()} | API: {prov.upper()} | Model: {api_active_model_raw(cfg) or '(unset)'}", width=min(cols, 120)))
     return 0
-
 
 def run_last_error(cfg: dict) -> int:
     cols, _ = term_size()
@@ -74,7 +94,6 @@ def run_last_error(cfg: dict) -> int:
     print(wrap(f"backend: {last.get('backend','')}", width=min(cols, 120)))
     print(wrap(str(last.get('detail',''))[:6000], width=min(cols, 120)))
     return 0
-
 
 def run_status(cfg: dict) -> int:
     cols, _ = term_size()
@@ -111,13 +130,12 @@ def run_status(cfg: dict) -> int:
     kv("local.ask", local_model_for(cfg, "ask") or "(kosong)")
     kv("local.cmd", local_model_for(cfg, "cmd") or "(kosong)")
 
-    h("2.1) Dependency opsional (tidak wajib)")
+    h("2.1) Dependency opsional")
     try:
-        import prompt_toolkit  # type: ignore  # noqa: F401
-        kv("prompt_toolkit", "TERPASANG ✅ (input editor enak)")
+        import prompt_toolkit  # noqa: F401
+        kv("prompt_toolkit", "TERPASANG ✅")
     except Exception:
-        kv("prompt_toolkit", "BELUM ❌ (fallback input biasa)")
-        kv("saran dnf", "sudo dnf install -y python3-prompt-toolkit")
+        kv("prompt_toolkit", "BELUM ❌")
 
     wl = which("wl-copy")
     xclip = which("xclip")
@@ -130,49 +148,35 @@ def run_status(cfg: dict) -> int:
         kv("clipboard", "xsel ✅ (X11)")
     else:
         kv("clipboard", "tidak ada (opsional)")
-        kv("saran dnf", "sudo dnf install -y wl-clipboard  # atau xclip/xsel")
 
-    kv("code (VS Code CLI)", "ADA ✅" if which("code") else "TIDAK ❌ (opsional)")
+    kv("code (CLI)", "ADA ✅" if which("code") else "TIDAK ❌")
 
     # 3) LOCAL readiness
     h("3) Kesiapan server AI LOCAL (Ollama)")
     host = ollama_host(cfg)
     kv("host", host)
-
     local_res = local_readiness(cfg)
     kv("status", "READY ✅" if local_res.get("ok") else "NOT READY ❌")
     kv("detail", str(local_res.get("detail") or local_res.get("catatan") or ""))
 
-    models = local_res.get("models") or []
-    if models:
-        print("  Model terdeteksi (ringkas):")
-        for m in models[:12]:
-            print(f"   - {m}")
-        if len(models) > 12:
-            print("   - ...")
-
     # 4) API readiness
-    h("4) Kesiapan API (konfigurasi + koneksi ringan)")
+    h("4) Kesiapan API")
     prov = api_provider(cfg)
     ok_cfg, note_cfg, detail_cfg = validate_api_config(cfg)
 
     if prov == "gemini":
         key, env_name = gemini_key(cfg)
-        kv("env var", f"{env_name} (terdeteksi: {'YA ✅' if key else 'TIDAK ❌'})")
-    else:
-        kv("env var", "(provider bukan gemini / belum ada handler env di status)")
+        kv("env var", f"{env_name} ({'YA' if key else 'TIDAK'})")
 
     kv("status", "READY ✅" if ok_cfg else "NOT READY ❌")
-    kv("detail", detail_cfg if ok_cfg else f"{note_cfg} • {detail_cfg}")
 
     api_model_ok = False
-    api_model_detail = ""
     if ok_cfg and prov == "gemini":
         api_model_ok, api_model_detail = model_support_summary(cfg)
         kv("model check", "OK ✅" if api_model_ok else "FAIL ❌")
         kv("model detail", api_model_detail)
 
-    # 5) Self-test opsional (API hanya kalau user mengizinkan)
+    # 5) Self-test (Modified to use generic input/output flow for snippet brevity)
     h("5) Pengujian runtime (self-test)")
     want_api_test = False
     if ok_cfg and prov == "gemini" and api_model_ok:

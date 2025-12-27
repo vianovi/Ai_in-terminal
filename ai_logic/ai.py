@@ -1,42 +1,33 @@
-from __future__ import annotations
-
-from ai_logic import status
-
-
-def _ai_help() -> None:
-    print("Usage:")
-    print("  ./ai-term ai status")
-    print("  ./ai-term ai help")
-    print("Alias:")
-    print("  ./ai-term ai --status")
-    print("  ./ai-term ai --help")
-    print("  ./ai-term ai -h")
-
+"""
+Router (File) untuk command 'ai'.
+Menerima request dari bridge, lalu melempar ke sub-handler di folder aisub/
+"""
+from ai_logic.ui import ansi
+# Arahkan ke folder baru "aisub" agar tidak bentrok dengan nama file ini "ai.py"
+from ai_logic.aisub import registry
 
 def handle(argv: list[str], cfg: dict) -> int:
-    """
-    Router internal subcommand `ai`.
-    Baseline: status, help + alias (sesuai blueprint).
-    """
+    # 1. Handle default/no-arg -> Help
     if not argv:
-        _ai_help()
-        return 2
+        return registry.dispatch("help", [], cfg)
 
-    a0 = argv[0].strip().lower()
+    # 2. Normalize subcommand (handle alias)
+    cmd = argv[0].lower().strip()
+    rest = argv[1:]
 
-    if a0 in ("-h", "--help", "help"):
-        _ai_help()
-        return 0
+    # Alias mapping
+    aliases = {
+        "-h": "help",
+        "--help": "help",
+        "--status": "status",
+    }
+    cmd = aliases.get(cmd, cmd)
 
-    if a0 in ("--status", "status"):
-        return status.run_status(cfg)
+    # 3. Dispatch ke registry (yang ada di folder aisub)
+    if registry.exists(cmd):
+        return registry.dispatch(cmd, rest, cfg)
 
-    # Futureproof placeholders (tidak mengganggu baseline)
-    if a0 in ("last-error", "--last-error"):
-        return status.run_last_error(cfg)
-
-    if a0 in ("info", "--info"):
-        return status.run_info(cfg)
-
-    _ai_help()
+    # 4. Handle unknown
+    ansi.print_brief_error(f"Unknown ai subcommand: '{cmd}'")
+    ansi.print_info("Try './ai-term ai help' to see available commands.")
     return 2
