@@ -4,49 +4,18 @@ from __future__ import annotations
 import sys
 
 from ai_logic.common import load_config
-from ai_logic.ask import handle_ask
-from ai_logic.cmd import handle_cmd
-from ai_logic.ai import handle_ai
-
-
-def print_usage() -> int:
-    print("Format penggunaan:")
-    print('  ask "..."')
-    print('  ask "hello"    # masuk chat')
-    print('  cmd "..."')
-    print('  ai --help')
-    print('  ai status      # alias ai run status')
-    print('  ai run status')
-    return 2
+from ai_logic.bridge import dispatch
 
 
 def main(argv: list[str]) -> int:
-    if len(argv) < 2:
-        return print_usage()
-
-    mode = (argv[1] or "").strip().lower()
     cfg = load_config()
-
-    if mode == "ask":
-        if len(argv) < 3:
-            return print_usage()
-        return handle_ask(argv[2:], cfg)
-
-    if mode == "cmd":
-        if len(argv) < 3:
-            return print_usage()
-        return handle_cmd(argv[2:], cfg)
-
-    if mode == "ai":
-        # ai boleh dipanggil tanpa arg → tampilkan help
-        return handle_ai(argv[2:], cfg)
-
-    return print_usage()
+    return dispatch(argv, cfg)
 
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main(sys.argv))
+        raise SystemExit(main(sys.argv[1:]))
     except KeyboardInterrupt:
+        # Entry-point tetap tipis: cukup exit code standar.
         print("\nDibatalkan oleh pengguna.")
         raise SystemExit(130)

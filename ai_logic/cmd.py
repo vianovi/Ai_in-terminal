@@ -2,44 +2,63 @@ from __future__ import annotations
 
 import json
 import os
-import sys
+import subprocess
+from shutil import which
 
-from ai_logic.common import (
+from ai_logic.common import mem_context_text, record_last_error, backend_mode, route_for
+from ai_logic.ui.ansi import (
     Spinner,
-    api_generate,
-    api_model_display,
-    api_tokens_oneshot,
-    backend_mode,
+    flush_stdin,
+    print_brief_error,
+    print_info,
+    print_meta_line,
+    prompt_text,
+    tag,
+    wrap,
+    term_size,
     c_bold,
     c_green,
     c_red,
     c_reset,
     c_yellow,
-    confirm,
-    copy_to_clipboard,
-    flush_stdin,
-    is_denied,
-    local_model_for,
-    local_tokens_for_cmd,
-    mem_context_text,
-    ollama_chat,
-    ollama_host,
-    print_brief_error,
-    print_info,
-    print_meta_line,
-    record_last_error,
-    route_for,
-    run_command,
-    tag,
-    validate_api_config,
-    wrap,
 )
 
+from ai_logic.backends.api_gemini import generate as gemini_generate, validate_api_config, gemini_model_id
+from ai_logic.backends.local_ollama import chat as ollama_chat, ollama_host, local_model_for
+from ai_logic.ui.prompts import local_tokens_for_cmd
 
-def mode_cmd(text: str, cfg: dict) -> int:
+
+DENY_SUBSTRINGS = [
+    "rm -rf /",
+    " mkfs",
+    "dd if=",
+    ":(){:|:&};:",
+    " shutdown",
+    " reboot",
+    " poweroff",
+]
+
+
+def _cmd_help() -> None:
+    print("Usage:")
+    print('  ./ai-term cmd "..."' )
+    print("Flags:")
+    print("  --help   Tampilkan help")
+
+
+def handle(argv: list[str], cfg: dict) -> int:
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        _cmd_help()
+        return 2
+
+    text = " ".join(argv).strip()
+    if not text:
+        _cmd_help()
+        return 2
+
     mode = backend_mode(cfg)
     backend, route = route_for(cfg, "cmd")
-    model = api_model_display(cfg) if backend == "api" else (local_model_for(cfg, "cmd") or "(unset)")
+    model = gemini_model_id(cfg) if backend == "api" else (local_model_for(cfg, "cmd") or "(unset)")
     print_meta_line("CMD", route, model)
 
     pwd = os.getcwd()
@@ -67,7 +86,6 @@ def mode_cmd(text: str, cfg: dict) -> int:
             "risk": {"type": "string"},
         },
         "required": ["purpose", "command", "risk"],
-        "additionalProperties": False,
     }
 
     def parse_obj(raw: str) -> tuple[str, str, str]:
@@ -84,7 +102,7 @@ def mode_cmd(text: str, cfg: dict) -> int:
             {"role": "user", "content": f"Perbaiki output ini menjadi JSON valid sesuai schema (jangan ubah makna):\n{raw}"},
         ]
         if backend_name == "api":
-            return api_generate(cfg, fixer, timeout=30, max_output_tokens=220, json_schema=json_schema)
+            return gemini_generate(cfg, fixer, timeout=30, max_output_tokens=220, json_schema=json_schema)
         host = ollama_host(cfg)
         m = local_model_for(cfg, "cmd") or "llama3.1:8b"
         return ollama_chat(host, m, fixer, timeout=60, num_predict=72)
@@ -96,13 +114,12 @@ def mode_cmd(text: str, cfg: dict) -> int:
         ok, note, detail = validate_api_config(cfg)
         if not ok:
             record_last_error("cmd", "api", f"{note}\n{detail}")
-            if mode == "api":
-                print_brief_error(note)
+            print_info(f"{tag('SISTEM AI', c_yellow())} API tidak siap: {note}. Fallback ke LOCAL.")
             backend = "local"
         else:
             try:
                 with Spinner("Aku lagi nyari command terbaik..."):
-                    raw = api_generate(cfg, messages, timeout=70, max_output_tokens=420, json_schema=json_schema)
+                    raw = gemini_generate(cfg, messages, timeout=70, max_output_tokens=420, json_schema=json_schema)
                 flush_stdin()
                 try:
                     purpose, cmd, risk = parse_obj(raw)
@@ -118,7 +135,8 @@ def mode_cmd(text: str, cfg: dict) -> int:
             except Exception as ex:
                 record_last_error("cmd", "api", str(ex))
                 flush_stdin()
-                print_info(f"{tag('AUTO', c_yellow())} -> {tag('LOCAL', c_green())} • {local_model_for(cfg,'cmd') or '(unset)'}")
+                if mode in ("auto", "api"):
+                    print_info(f"{tag('SISTEM AI', c_yellow())} API error. Fallback ke LOCAL.")
                 backend = "local"
 
     # LOCAL path
@@ -146,40 +164,82 @@ def mode_cmd(text: str, cfg: dict) -> int:
         print_brief_error("Mode lokal juga gagal")
         return 2
 
+
+def is_denied(cmd: str) -> bool:
+    c = (cmd or "").strip()
+    if not c or "\n" in c or "\r" in c:
+        return True
+    for bad in DENY_SUBSTRINGS:
+        if bad in c:
+            return True
+    return False
+
+
+def confirm(prompt: str) -> bool:
+    ans = prompt_text(prompt).strip().lower()
+    return ans == "y"
+
+
+def run_command(cmd: str) -> int:
+    p = subprocess.run(cmd, shell=True)
+    return int(p.returncode)
+
+
+def copy_to_clipboard(text: str) -> bool:
+    if not (text or "").strip():
+        return False
+    wl = which("wl-copy")
+    if wl:
+        try:
+            p = subprocess.Popen([wl], stdin=subprocess.PIPE)
+            p.communicate(text.encode("utf-8"))
+            return p.returncode == 0
+        except Exception:
+            return False
+    xclip = which("xclip")
+    if xclip:
+        try:
+            p = subprocess.Popen([xclip, "-selection", "clipboard"], stdin=subprocess.PIPE)
+            p.communicate(text.encode("utf-8"))
+            return p.returncode == 0
+        except Exception:
+            return False
+    xsel = which("xsel")
+    if xsel:
+        try:
+            p = subprocess.Popen([xsel, "--clipboard", "--input"], stdin=subprocess.PIPE)
+            p.communicate(text.encode("utf-8"))
+            return p.returncode == 0
+        except Exception:
+            return False
+    return False
+
+
 def render_cmd_flow(cmd: str, risk: str, purpose: str) -> int:
-    cols = 120
+    cols, _ = term_size()
 
     if is_denied(cmd):
-        sys.stdout.write(f"{tag('BLOCKED', c_red())} Aku blokir perintah ini karena terdeteksi berbahaya.\n")
-        sys.stdout.flush()
+        print(f"{tag('BLOCKED', c_red())} Aku blokir perintah ini karena terdeteksi berbahaya.")
         return 3
 
     if purpose:
-        sys.stdout.write(f"{c_bold()}Tujuan:{c_reset()} {wrap(purpose, width=min(cols, 120))}\n")
-    sys.stdout.write(f"{c_bold()}Command:{c_reset()} {cmd}\n")
-    sys.stdout.write(f"{c_bold()}Risiko:{c_reset()} {wrap(risk or 'Risiko tidak dijelaskan.', width=min(cols, 120))}\n")
-    sys.stdout.flush()
+        print(f"{c_bold()}Tujuan:{c_reset()} {wrap(purpose, width=min(cols, 120))}")
+    print(f"{c_bold()}Command:{c_reset()} {cmd}")
+    print(f"{c_bold()}Risiko:{c_reset()} {wrap(risk or 'Risiko tidak dijelaskan.', width=min(cols, 120))}")
 
-    if "sudo" in cmd.split():
+    if "sudo" in (cmd or "").split():
         if not confirm("🔐 Command ini pakai sudo. Tetap lanjut? [y/N]: "):
             if copy_to_clipboard(cmd):
-                sys.stdout.write(f"{tag('INFO', c_yellow())} Command aku salin ke clipboard.\n")
-            sys.stdout.write(f"{tag('CANCEL', c_yellow())} Aku batalin.\n")
-            sys.stdout.flush()
+                print_info("Command aku salin ke clipboard.")
+            print(f"{tag('CANCEL', c_yellow())} Aku batalin.")
             return 0
 
     if confirm("⚠️  Jalankan command ini? [y/N]: "):
         rc = run_command(cmd)
-        sys.stdout.write(f"{tag('DONE', c_green())} Selesai. Exit code: {rc}\n")
-        sys.stdout.flush()
+        print(f"{tag('DONE', c_green())} Selesai. Exit code: {rc}")
         return rc
 
     if copy_to_clipboard(cmd):
-        sys.stdout.write(f"{tag('INFO', c_yellow())} Command aku salin ke clipboard.\n")
-    sys.stdout.write(f"{tag('CANCEL', c_yellow())} Aku batalin. Command tidak dijalankan.\n")
-    sys.stdout.flush()
+        print_info("Command aku salin ke clipboard.")
+    print(f"{tag('CANCEL', c_yellow())} Aku batalin. Command tidak dijalankan.")
     return 0
-
-def handle_cmd(argv: list[str], cfg: dict) -> int:
-    text = " ".join(argv).strip()
-    return mode_cmd(text, cfg)
