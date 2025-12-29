@@ -10,6 +10,7 @@ from shutil import which
 from ai_logic.common import (
     CONFIG_PATH,
     MEMORY_PATH,
+    MON_HISTORY_PATH,
     LAST_ERROR_PATH,
     LOGIC_PATH,
     FISH_DIR,
@@ -113,6 +114,7 @@ def run_status(cfg: dict) -> int:
     kv("Logic", _fmt_path(LOGIC_PATH))
     kv("Config", _fmt_path(CONFIG_PATH))
     kv("Memory", _fmt_path(MEMORY_PATH))
+    kv("Mon history", _fmt_path(MON_HISTORY_PATH))
     kv("Last error", _fmt_path(LAST_ERROR_PATH))
     kv("Fish config", _fmt_path(FISH_DIR))
     kv("Fish funcs", _fmt_path(FISH_FUNCS_DIR))
