@@ -279,7 +279,7 @@ def _chat_loop(argv: list[str], cfg: dict) -> int:
                                 "role": "system",
                                 "content": (
                                     "Ringkas percakapan ini untuk memori singkat.\n"
-                                    "- Tulis 3–5 kalimat Bahasa Indonesia yang lengkap.\n"
+                                    "- kalimat Bahasa Indonesia yang lengkap.\n"
                                     "- Sebutkan topik utama + preferensi/keputusan user bila ada.\n"
                                     "- Jangan simpan credential/rahasia.\n"
                                     "- Jangan terlalu singkat (minimal ~20 kata)."
