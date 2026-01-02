@@ -51,7 +51,7 @@ target = argv[0]
 
 # ❌ Salah (Dilarang)
 import sys
-target = sys.argv[2] 
+target = sys.argv[2]
 ```
 
 ### 4. Konsistensi UI (Tampilan)
@@ -79,7 +79,7 @@ Jangan mengimport `registry.py` atau `ai_logic/ai.py` di dalam logika global sub
 Gunakan template ini saat memulai file baru atau mengisi stub:
 
 ```python
-"""Deskripsi singkat command ini (Maks 1 kalimat)."""
+"""Deskripsi command ini dam dafatr commnad, wajib jelas dan boleh panjang"""
 
 from ai_logic.ui import ansi
 # Import backend jika butuh:
@@ -91,7 +91,7 @@ def handle(argv: list[str], cfg: dict) -> int:
     argv: List argumen input.
     cfg: Dict konfigurasi system.
     """
-    
+
     # 1. Validasi Argumen
     if not argv:
         ansi.print_brief_error("Error: Argumen kurang.")
@@ -105,7 +105,7 @@ def handle(argv: list[str], cfg: dict) -> int:
     # 3. Logika (Contoh)
     try:
         # Panggil backend logic di sini...
-        pass 
+        pass
     except Exception as e:
         ansi.print_brief_error(f"Terjadi kesalahan: {e}")
         return 1

@@ -18,6 +18,7 @@ CONFIG_PATH = APP_DIR / "config.json"
 MEMORY_PATH = APP_DIR / "memory.json"
 LAST_ERROR_PATH = APP_DIR / "last_error.json"
 MON_HISTORY_PATH = APP_DIR / "mon_history.json"
+RUN_PROFILE_PATH = APP_DIR / "run_profile.json"
 
 # Informational paths (untuk status)
 LOGIC_PATH = Path.home() / ".local" / "bin" / "ai-term"
