@@ -2,34 +2,37 @@
 AI-Term • MON (System Cockpit & Intelligence) — V3
 
 Tujuan:
-- `ai mon live`     : HUD realtime yang enak dipandang + informatif (tanpa noise).
-- `ai mon sensors`  : tampilkan SEMUA sensor/field yang bisa dibaca (psutil + sysfs + optional tools).
-- `ai mon batt`     : laporan battery intelligence + history tracking.
-- `ai mon disk`     : laporan storage SMART/TBW + history tracking.
-- `ai mon net`      : laporan network diagnostics + wifi detail.
-- `ai mon net live` : live ping graph (alt-screen).
+- `ai mon live`    : HUD realtime yang enak dipandang + informatif (tanpa noise seperti per-core temp).
+- `ai mon sensors` : tampilkan SEMUA sensor/field yang bisa dibaca (psutil + sysfs + optional tools).
+- `ai mon batt`    : laporan battery intel + history tracking.
+- `ai mon disk`    : laporan storage SMART/TBW + history tracking (tanpa memaksa sudo).
+- `ai mon net`     : network diagnostics (ping/dns + wifi detail).
+- `ai mon net live`: live ping graph.
+
+V3 Update (baru):
+- SWAP usage ditampilkan di HUD.
+- Disk I/O ala Windows Task Manager:
+  - Active time (%) + read/write speed real-time dari /sys/block/<dev>/stat (tanpa sudo).
+- GPU usage (opsional):
+  - Prefer sysfs: /sys/class/drm/card*/device/gpu_busy_percent (Intel/AMD biasanya ada).
+  - Fallback NVIDIA: `nvidia-smi` jika tersedia.
+- Ping quality & jitter (opsional) ditampilkan di HUD (sampler background).
+- Footer: info kernel + nama hardware penting (CPU/GPU/NVMe) + caching agar tidak berat.
 
 Catatan desain:
-- Dependency utama: `psutil` (wajib untuk fitur monitoring).
+- Dependency utama: `psutil` (Wajib untuk monitoring).
   Install Fedora: sudo dnf install python3-psutil
+- Optional tools:
+  sudo dnf install lm_sensors smartmontools pciutils iw iproute
+  (optional GPU NVIDIA): nvidia-smi (paket driver NVIDIA)
 - History path: ai_logic.common.MON_HISTORY_PATH (fallback aman bila common belum update).
-- ANSI-only (tanpa rich), konsisten dengan project.
-- Tidak memunculkan ERROR yang bikin panik untuk kondisi wajar (sensor tidak tersedia).
-- Disk SMART/TBW: default tidak memaksa sudo (tidak munculkan prompt password).
-  Kalau butuh data lengkap: `sudo ai mon disk`.
-- GPU usage (opsional):
-  - Prioritas: pynvml (NVML) -> nvidia-smi -> sysfs DRM gpu_busy_percent.
-
-Update besar V3 (dibanding V2):
-- GPU usage (util%, VRAM, temp bila ada).
-- Disk I/O realtime (active% + read/write speed) via /sys/block/<dev>/stat (tanpa sudo).
-- SWAP usage.
-- Ping latency + jitter di HUD (background sampler, tidak mengganggu UI).
-- NVMe extra: model NVMe (footer) + disk device selection dari mount '/'.
-- Footer: OS/Kernel/Arch + hardware penting (CPU model, NVMe model, GPU hint).
+- Tidak memakai rich (ANSI-only, konsisten dengan project).
+- Tidak memunculkan ERROR yang bikin panik untuk kondisi wajar (mis. sensor tidak tersedia).
+- Disk SMART/TBW: default tidak memaksa sudo (agar tidak memunculkan prompt password).
+  Untuk data lengkap: jalankan `sudo ai mon disk`.
 
 Subcommands:
-  ai mon live [--interval N] [--compact] [--no-ping] [--target HOST] [--iface IFACE]
+  ai mon live [--interval N] [--compact] [--target HOST] [--iface IFACE]
   ai mon sensors
   ai mon batt
   ai mon disk [--sudo|--deep]
@@ -39,13 +42,11 @@ Subcommands:
 
 History file:
 - MON_HISTORY_PATH (default: ~/.config/ai-term/mon_history.json)
-
 """
 
 from __future__ import annotations
 
 import os
-import sys
 import time
 import json
 import shutil
@@ -55,7 +56,7 @@ import subprocess
 import threading
 from collections import deque
 from pathlib import Path
-from typing import Any, Optional, List
+from typing import Any, Dict, Optional, Tuple, List
 
 # --- COMMON IMPORT (single source of truth) ---
 try:
@@ -73,13 +74,6 @@ try:
 except Exception:
     psutil = None
 
-# --- Optional Dependency: NVML (GPU NVIDIA) ---
-_pynvml = None
-try:
-    import pynvml as _pynvml  # type: ignore
-except Exception:
-    _pynvml = None
-
 
 # ==========================================================
 # 0) UTILITIES (safe io, shell, formatting)
@@ -87,7 +81,6 @@ except Exception:
 
 def _now_ts() -> str:
     return _dt.datetime.now().strftime("%A | %H:%M:%S")
-
 
 def _sh(cmd: str, timeout: int = 10) -> tuple[int, str]:
     """
@@ -111,13 +104,11 @@ def _sh(cmd: str, timeout: int = 10) -> tuple[int, str]:
     except Exception:
         return 1, ""
 
-
 def _read_text(p: Path) -> str:
     try:
         return p.read_text(encoding="utf-8", errors="replace").strip()
     except Exception:
         return ""
-
 
 def _read_int(p: Path) -> Optional[int]:
     try:
@@ -126,7 +117,6 @@ def _read_int(p: Path) -> Optional[int]:
     except Exception:
         return None
 
-
 def _read_float(p: Path) -> Optional[float]:
     try:
         s = _read_text(p)
@@ -134,14 +124,12 @@ def _read_float(p: Path) -> Optional[float]:
     except Exception:
         return None
 
-
 def _clamp(n: float, lo: float, hi: float) -> float:
     if n < lo:
         return lo
     if n > hi:
         return hi
     return n
-
 
 def _human_bytes(n: float) -> str:
     units = ["B", "KB", "MB", "GB", "TB"]
@@ -152,10 +140,8 @@ def _human_bytes(n: float) -> str:
         v /= 1024.0
     return f"{v:.1f}PB"
 
-
 def _human_rate_bps(bps: float) -> str:
     return _human_bytes(bps) + "/s"
-
 
 def _draw_bar(pct: float, width: int = 14) -> str:
     pct = _clamp(float(pct), 0.0, 100.0)
@@ -163,29 +149,7 @@ def _draw_bar(pct: float, width: int = 14) -> str:
     col = ansi.c_green() if pct <= 60 else (ansi.c_yellow() if pct <= 85 else ansi.c_red())
     return f"{col}{'█'*fill}{ansi.c_dim()}{'░'*(width-fill)}{ansi.c_reset()}"
 
-
-def _tcol(v: Optional[float]) -> str:
-    if v is None:
-        return ansi.c_dim()
-    if v < 70:
-        return ansi.c_green()
-    if v < 85:
-        return ansi.c_yellow()
-    return ansi.c_red()
-
-
-def _sigcol_dbm(dbm: Optional[float]) -> str:
-    # Rough Wi-Fi signal tier
-    if dbm is None:
-        return ansi.c_dim()
-    if dbm >= -55:
-        return ansi.c_green()
-    if dbm >= -67:
-        return ansi.c_yellow()
-    return ansi.c_red()
-
-
-def _ping_col(ms: Optional[float]) -> str:
+def _col_by_ping(ms: Optional[float]) -> str:
     if ms is None:
         return ansi.c_dim()
     if ms <= 40:
@@ -194,16 +158,40 @@ def _ping_col(ms: Optional[float]) -> str:
         return ansi.c_yellow()
     return ansi.c_red()
 
+def _col_by_dbm(dbm: Optional[float]) -> str:
+    if dbm is None:
+        return ansi.c_dim()
+    if dbm >= -55:
+        return ansi.c_green()
+    if dbm >= -67:
+        return ansi.c_yellow()
+    return ansi.c_red()
 
-def _safe_center(s: str, width: int) -> str:
-    if width <= 0:
-        return s
-    if len(s) >= width:
-        return s[:width]
-    pad = width - len(s)
-    left = pad // 2
-    right = pad - left
-    return (" " * left) + s + (" " * right)
+def _col_by_temp(v: Optional[float]) -> str:
+    if v is None:
+        return ansi.c_dim()
+    if v < 70:
+        return ansi.c_green()
+    if v < 85:
+        return ansi.c_yellow()
+    return ansi.c_red()
+
+def _uname_kernel() -> str:
+    try:
+        return os.uname().release
+    except Exception:
+        return _read_text(Path("/proc/sys/kernel/osrelease")) or "-"
+
+def _distro_pretty() -> str:
+    p = Path("/etc/os-release")
+    if not p.exists():
+        return ""
+    txt = _read_text(p)
+    for ln in txt.splitlines():
+        if ln.startswith("PRETTY_NAME="):
+            v = ln.split("=", 1)[1].strip().strip('"')
+            return v
+    return ""
 
 
 # ==========================================================
@@ -217,7 +205,6 @@ def _ensure_history_ready() -> None:
     except Exception:
         pass
 
-
 def _load_db() -> dict:
     p = Path(MON_HISTORY_PATH)
     if not p.exists():
@@ -228,14 +215,12 @@ def _load_db() -> dict:
     except Exception:
         return {}
 
-
 def _save_db(data: dict) -> None:
     _ensure_history_ready()
     try:
         Path(MON_HISTORY_PATH).write_text(json.dumps(data, indent=2), encoding="utf-8")
     except Exception:
         pass
-
 
 def snapshot_metric(category: str, item_id: str, metric: str, value: float) -> bool:
     """
@@ -257,7 +242,6 @@ def snapshot_metric(category: str, item_id: str, metric: str, value: float) -> b
     db[category][item_id][metric][today] = value
     _save_db(db)
     return True
-
 
 def get_comparison_text(category: str, item_id: str, metric: str, current: float, unit: str = "") -> str:
     """
@@ -302,14 +286,13 @@ class SensorProbe:
     @staticmethod
     def tool_presence() -> dict:
         return {
-            "psutil": bool(psutil),
-            "pynvml(NVML)": bool(_pynvml),
             "sensors(lm_sensors)": bool(shutil.which("sensors")),
             "smartctl(smartmontools)": bool(shutil.which("smartctl")),
             "iw(iw)": bool(shutil.which("iw")),
             "lspci(pciutils)": bool(shutil.which("lspci")),
             "ip(iproute2)": bool(shutil.which("ip")),
-            "nvidia-smi": bool(shutil.which("nvidia-smi")),
+            "ping(iputils)": bool(shutil.which("ping")),
+            "nvidia-smi(nvidia)": bool(shutil.which("nvidia-smi")),
         }
 
     @staticmethod
@@ -328,7 +311,7 @@ class SensorProbe:
             sample: dict[str, Any] = {}
             for k, entries in temps.items():
                 sample[k] = []
-                for e in entries[:10]:
+                for e in entries[:16]:
                     sample[k].append({
                         "label": getattr(e, "label", "") or "",
                         "current": getattr(e, "current", None),
@@ -347,7 +330,7 @@ class SensorProbe:
             sample_f: dict[str, Any] = {}
             for k, entries in fans.items():
                 sample_f[k] = []
-                for e in entries[:10]:
+                for e in entries[:16]:
                     sample_f[k].append({
                         "label": getattr(e, "label", "") or "",
                         "current": getattr(e, "current", None),
@@ -374,14 +357,16 @@ class SensorProbe:
         # swap
         try:
             sw = psutil.swap_memory()
-            out["swap_psutil"] = {
-                "total": getattr(sw, "total", None),
-                "used": getattr(sw, "used", None),
-                "free": getattr(sw, "free", None),
-                "percent": getattr(sw, "percent", None),
+            out["swap"] = {
+                "total": sw.total,
+                "used": sw.used,
+                "free": sw.free,
+                "percent": sw.percent,
+                "sin": sw.sin,
+                "sout": sw.sout,
             }
         except Exception as ex:
-            out["swap_psutil_err"] = str(ex)
+            out["swap_err"] = str(ex)
 
         return out
 
@@ -402,71 +387,62 @@ class SensorProbe:
                         fields.append(f.name)
             except Exception:
                 fields = []
+
             d["items"].append({"name": item.name, "path": str(item), "fields": fields})
         return d
 
     @staticmethod
-    def sysfs_drm_gpu_tree() -> dict:
+    def sysfs_drm_gpu_busy() -> dict[str, Any]:
+        """
+        Scan /sys/class/drm/card*/device/gpu_busy_percent (jika ada).
+        """
         root = Path("/sys/class/drm")
-        d: dict[str, Any] = {"exists": root.exists(), "cards": []}
+        out: dict[str, Any] = {"exists": root.exists(), "cards": []}
         if not root.exists():
-            return d
+            return out
 
-        for card in sorted(root.glob("card*")):
-            if not card.is_dir():
+        for c in sorted(root.glob("card[0-9]*")):
+            if not c.is_dir():
                 continue
-            device = card / "device"
-            if not device.exists():
-                continue
-
-            interesting: list[str] = []
-            try:
-                for f in sorted(device.iterdir()):
-                    if not f.is_file():
-                        continue
-                    nm = f.name
-                    if "busy" in nm or "gpu" in nm or "mem" in nm or nm in ("vendor", "device", "subsystem_vendor", "subsystem_device"):
-                        interesting.append(nm)
-            except Exception:
-                interesting = []
-
-            d["cards"].append({
-                "card": card.name,
-                "device": str(device),
-                "interesting_files": interesting[:80],
-                "busy_candidates": [x for x in interesting if "busy" in x],
+            dev = c / "device"
+            f = dev / "gpu_busy_percent"
+            out["cards"].append({
+                "card": c.name,
+                "gpu_busy_percent_path": str(f),
+                "gpu_busy_percent_exists": f.exists(),
+                "vendor": _read_text(dev / "vendor"),
+                "device": _read_text(dev / "device"),
+                "driver": (dev / "driver").exists(),
             })
-        return d
+        return out
 
     @staticmethod
-    def sysfs_block_tree(limit: int = 16) -> dict:
+    def sysfs_block_stat_inventory() -> dict[str, Any]:
+        """
+        List /sys/block/*/stat & queue/hw_sector_size untuk disk I/O sampling.
+        """
         root = Path("/sys/block")
-        d: dict[str, Any] = {"exists": root.exists(), "devices": []}
+        out: dict[str, Any] = {"exists": root.exists(), "devices": []}
         if not root.exists():
-            return d
-
-        cnt = 0
-        for dev in sorted(root.iterdir()):
-            if not dev.is_dir():
+            return out
+        for d in sorted(root.iterdir()):
+            if not d.is_dir():
                 continue
-            name = dev.name
+            name = d.name
             if name.startswith(("loop", "zram", "ram", "sr")):
                 continue
-            stat_p = dev / "stat"
-            ss_p = dev / "queue" / "hw_sector_size"
-            d["devices"].append({
+            stat = d / "stat"
+            qsz = d / "queue" / "hw_sector_size"
+            out["devices"].append({
                 "name": name,
-                "has_stat": stat_p.exists(),
-                "sector_size": _read_text(ss_p) if ss_p.exists() else "",
+                "stat_exists": stat.exists(),
+                "sector_size": _read_text(qsz) if qsz.exists() else "",
             })
-            cnt += 1
-            if cnt >= limit:
-                break
-        return d
+        return out
 
 
 # ==========================================================
-# 3) CORE READERS (battery/power, temps, fan, net, ping, disk I/O, gpu)
+# 3) CORE READERS (battery/power, temps, fan, net, swap)
 # ==========================================================
 
 class PowerReader:
@@ -505,11 +481,9 @@ class PowerReader:
 
         res["batt_name"] = batt.name
 
-        # Status raw
         st = _read_text(batt / "status") or "Unknown"
         res["status_raw"] = st
 
-        # psutil percent/time-left
         if psutil is not None:
             try:
                 b = psutil.sensors_battery()
@@ -520,7 +494,6 @@ class PowerReader:
             except Exception:
                 pass
 
-        # Sysfs: voltage_now (uV), power_now (uW) or current_now (uA)
         v_uv = _read_float(batt / "voltage_now")
         if v_uv is not None:
             res["volt"] = float(v_uv) / 1e6
@@ -536,17 +509,16 @@ class PowerReader:
             c_ua = _read_float(batt / "current_now")
 
         if p_uw is not None:
-            res["watt"] = float(p_uw) / 1e6
+            w = float(p_uw) / 1e6
+            res["watt"] = w
         elif (c_ua is not None) and (res["volt"] is not None):
             a = float(c_ua) / 1e6
             res["amp"] = a
             res["watt"] = float(res["volt"]) * a
 
-        # Amp from watt/volt if missing
         if (res["amp"] is None) and (res["watt"] is not None) and (res["volt"] is not None) and (res["volt"] > 0):
             res["amp"] = float(res["watt"]) / float(res["volt"])
 
-        # String formatting
         if res["watt"] is not None:
             w = float(res["watt"])
             res["watt_str"] = f"{w*1000:.0f} mW" if w < 1.0 else f"{w:.2f} W"
@@ -559,9 +531,6 @@ class PowerReader:
         return res
 
     def read_capacity_health(self) -> dict[str, Any]:
-        """
-        Read design vs full capacity (Wh/Ah) + cycle count if available.
-        """
         out: dict[str, Any] = {"ok": False}
         batt = self._pick_battery()
         if batt is None:
@@ -570,7 +539,6 @@ class PowerReader:
         model = _read_text(batt / "model_name") or batt.name
         out["model"] = model
 
-        # prefer energy_* (Wh)
         full = None
         design = None
         unit = "Wh"
@@ -605,13 +573,6 @@ class PowerReader:
 
 
 class ThermalReader:
-    """
-    Pilih sensor yang “bernilai” untuk HUD:
-    - CPU package/tctl
-    - NVMe composite
-    - WiFi-ish
-    Selain itu bisa diinspeksi via `ai mon sensors`.
-    """
     @staticmethod
     def read_key_temps() -> dict[str, Optional[float]]:
         res: dict[str, Optional[float]] = {"cpu": None, "ssd": None, "wifi": None}
@@ -622,7 +583,6 @@ class ThermalReader:
         except Exception:
             return res
 
-        # CPU package / tctl
         for key in ("coretemp", "k10temp"):
             entries = temps.get(key) or []
             best = None
@@ -637,7 +597,6 @@ class ThermalReader:
                 res["cpu"] = float(best)
                 break
 
-        # NVMe composite
         for k, entries in temps.items():
             lk = k.lower()
             if "nvme" in lk or "composite" in lk:
@@ -651,7 +610,6 @@ class ThermalReader:
                 if res["ssd"] is not None:
                     break
 
-        # WiFi-ish
         for k, entries in temps.items():
             lk = k.lower()
             if ("iwl" in lk) or ("wifi" in lk) or ("ath" in lk):
@@ -686,10 +644,6 @@ class ThermalReader:
 
 
 class NetSpeedometer:
-    """
-    Throughput realtime (RX/TX) via psutil.net_io_counters.
-    Default: aggregated all interfaces.
-    """
     def __init__(self, iface: Optional[str] = None):
         self.iface = iface
         self.t0 = time.time()
@@ -734,9 +688,6 @@ class NetSpeedometer:
 
 
 class WiFiReader:
-    """
-    Baca SSID/signal/bitrate (kalau `iw` ada).
-    """
     @staticmethod
     def _guess_wifi_iface() -> Optional[str]:
         if psutil is None:
@@ -795,83 +746,33 @@ class WiFiReader:
         return out
 
 
-class PingSampler:
-    """
-    Background ping sampler untuk HUD:
-    - last latency
-    - jitter (window max-min)
-    """
-    def __init__(self, target: str, interval: float = 5.0):
-        self.target = target
-        self.interval = float(_clamp(interval, 1.0, 30.0))
-        self.last_ms: Optional[float] = None
-        self.window = deque(maxlen=20)  # ms
-        self.last_err: str = ""
-        self._stop = threading.Event()
-        self._t = threading.Thread(target=self._loop, daemon=True)
-
-    def start(self) -> None:
-        if not self._t.is_alive():
-            self._t.start()
-
-    def stop(self) -> None:
-        self._stop.set()
-
-    def jitter(self) -> Optional[float]:
-        if len(self.window) < 3:
-            return None
-        return max(self.window) - min(self.window)
-
-    def _loop(self) -> None:
-        if not shutil.which("ping"):
-            self.last_err = "no-ping"
-            return
-
-        while not self._stop.is_set():
-            t0 = time.time()
-            ms = self._ping_once()
-            if ms is None:
-                self.last_ms = None
-                self.last_err = "timeout"
-            else:
-                self.last_ms = ms
-                self.window.append(ms)
-                self.last_err = ""
-
-            dt = time.time() - t0
-            wait = self.interval - dt
-            if wait > 0:
-                self._stop.wait(wait)
-
-    def _ping_once(self) -> Optional[float]:
+class SwapReader:
+    @staticmethod
+    def read() -> dict[str, Any]:
+        out: dict[str, Any] = {"ok": False, "pct": 0.0, "used": 0, "total": 0}
+        if psutil is None:
+            return out
         try:
-            p = subprocess.run(
-                ["ping", "-c", "1", "-W", "1", self.target],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-                timeout=2,
-            )
-            out = (p.stdout or "")
-            if "time=" in out:
-                s = out.split("time=", 1)[1].split()[0]
-                return float(s)
+            sw = psutil.swap_memory()
+            out.update({"ok": True, "pct": float(sw.percent), "used": int(sw.used), "total": int(sw.total)})
         except Exception:
-            return None
-        return None
+            pass
+        return out
 
+# ==========================================================
+# 4) DISK I/O SAMPLER (Active Time + R/W Speed via sysfs stat)
+# ==========================================================
 
-class DiskIOMeter:
+class DiskIOSampler:
     """
-    Disk Active Time (%) + Read/Write speed via /sys/block/<dev>/stat.
-    Works without sudo.
+    Sampling /sys/block/<dev>/stat
 
-    Indeks stat (Linux):
-      2 = sectors_read
-      6 = sectors_written
-      9 = io_time_ms
+    Index meaning (Linux block stat):
+      2: sectors read
+      6: sectors written
+      9: io_time_ms  (time spent doing I/Os)
     """
-    def __init__(self, dev: str):
+    def __init__(self, dev: str) -> None:
         self.dev = dev
         self.t0 = time.time()
         self.prev = self._read_stat()
@@ -883,31 +784,29 @@ class DiskIOMeter:
     def _read_sector_size(self) -> int:
         p = Path(f"/sys/block/{self.dev}/queue/hw_sector_size")
         v = _read_int(p)
-        return int(v) if v and v > 0 else 512
+        return int(v) if isinstance(v, int) and v > 0 else 512
 
     def _read_stat(self) -> Optional[List[int]]:
         p = Path(f"/sys/block/{self.dev}/stat")
-        raw = _read_text(p)
-        if not raw:
+        s = _read_text(p)
+        if not s:
             return None
         try:
-            return [int(x) for x in raw.split()]
+            return [int(x) for x in s.split()]
         except Exception:
             return None
 
     def update(self) -> None:
         cur = self._read_stat()
-        if cur is None or self.prev is None:
+        t1 = time.time()
+        dt = t1 - self.t0
+
+        if cur is None or self.prev is None or dt <= 0:
+            self.t0 = t1
             self.prev = cur
-            self.t0 = time.time()
             self.active_pct = 0.0
             self.read_bps = 0.0
             self.write_bps = 0.0
-            return
-
-        t1 = time.time()
-        dt = t1 - self.t0
-        if dt <= 0:
             return
 
         try:
@@ -917,220 +816,205 @@ class DiskIOMeter:
 
             self.read_bps = (d_read_sect * self.sector_size) / dt
             self.write_bps = (d_write_sect * self.sector_size) / dt
-            self.active_pct = float(_clamp((d_io_ms / (dt * 1000.0)) * 100.0, 0.0, 100.0))
+            self.active_pct = _clamp((d_io_ms / (dt * 1000.0)) * 100.0, 0.0, 100.0)
         except Exception:
             self.active_pct = 0.0
             self.read_bps = 0.0
             self.write_bps = 0.0
 
-        self.prev = cur
         self.t0 = t1
+        self.prev = cur
 
 
-class GPUReader:
+def _pick_root_disk_dev() -> Optional[str]:
     """
-    GPU usage reader (opsional) dengan prioritas:
-      1) NVML (pynvml)     -> util%, vram, temp, name
-      2) nvidia-smi        -> util%, vram, temp, name
-      3) sysfs drm         -> gpu_busy_percent (util only) + name hint (lspci)
+    Best-effort: choose disk backing '/'.
+    Strategy:
+    - find mount source for '/'
+    - lsblk -no PKNAME to get parent disk
+    - fallback: prefer nvme0n1, else first disk from lsblk
     """
-    def __init__(self) -> None:
-        self.backend = "none"
-        self._nvml_ready = False
+    # try find root source
+    src = ""
+    try:
+        code, out = _sh("findmnt -n -o SOURCE /", timeout=2)
+        if code == 0 and out:
+            src = out.strip()
+    except Exception:
+        src = ""
 
-        if _pynvml is not None:
-            try:
-                _pynvml.nvmlInit()
-                self._nvml_ready = True
-                self.backend = "pynvml"
-            except Exception:
-                self._nvml_ready = False
+    if src.startswith("/dev/"):
+        base = os.path.basename(src)
+        # if partition like nvme0n1p2 -> parent disk nvme0n1
+        code, out = _sh(f"lsblk -no PKNAME /dev/{base} 2>/dev/null", timeout=2)
+        if code == 0 and out.strip():
+            return out.strip()
+        # maybe already disk
+        if Path(f"/sys/block/{base}").exists():
+            return base
 
-        if self.backend == "none" and shutil.which("nvidia-smi"):
-            self.backend = "nvidia-smi"
+    # fallback: prefer nvme0n1
+    if Path("/sys/block/nvme0n1").exists():
+        return "nvme0n1"
 
-        if self.backend == "none" and self._has_sysfs_busy():
-            self.backend = "sysfs"
+    # fallback: first disk from lsblk
+    code, out = _sh("lsblk -d -n -o NAME,TYPE | awk '$2==\"disk\"{print $1}' | head -n 1", timeout=2)
+    if code == 0 and out.strip():
+        return out.strip()
 
-    def _has_sysfs_busy(self) -> bool:
-        root = Path("/sys/class/drm")
-        if not root.exists():
-            return False
-        for card in sorted(root.glob("card*")):
-            dev = card / "device"
-            if not dev.exists():
-                continue
-            if (dev / "gpu_busy_percent").exists():
-                return True
-            try:
-                for f in dev.iterdir():
-                    if f.is_file() and f.name.endswith("busy_percent"):
-                        return True
-            except Exception:
-                pass
-        return False
-
-    def read(self) -> dict[str, Any]:
-        # Canonical keys (konsisten):
-        out: dict[str, Any] = {
-            "ok": False,
-            "backend": self.backend,
-            "name": "",
-            "util_gpu": None,   # percent
-            "util_mem": None,   # percent (if available)
-            "mem_used": None,   # bytes (if available)
-            "mem_total": None,  # bytes (if available)
-            "temp": None,       # C (if available)
-            "note": "",
-        }
-
-        if self.backend == "pynvml":
-            return self._read_nvml(out)
-        if self.backend == "nvidia-smi":
-            return self._read_nvidia_smi(out)
-        if self.backend == "sysfs":
-            return self._read_sysfs(out)
-
-        out["note"] = "GPU backend not available"
-        return out
-
-    def _read_nvml(self, out: dict[str, Any]) -> dict[str, Any]:
-        if not self._nvml_ready or _pynvml is None:
-            out["note"] = "NVML not initialized"
-            return out
-        try:
-            h = _pynvml.nvmlDeviceGetHandleByIndex(0)
-            name = _pynvml.nvmlDeviceGetName(h)
-            if isinstance(name, bytes):
-                name = name.decode("utf-8", errors="replace")
-            out["name"] = str(name)
-
-            util = _pynvml.nvmlDeviceGetUtilizationRates(h)
-            out["util_gpu"] = float(getattr(util, "gpu", None)) if util else None
-            out["util_mem"] = float(getattr(util, "memory", None)) if util else None
-
-            try:
-                mem = _pynvml.nvmlDeviceGetMemoryInfo(h)
-                out["mem_used"] = int(getattr(mem, "used", 0))
-                out["mem_total"] = int(getattr(mem, "total", 0))
-            except Exception:
-                pass
-
-            try:
-                out["temp"] = float(_pynvml.nvmlDeviceGetTemperature(h, _pynvml.NVML_TEMPERATURE_GPU))
-            except Exception:
-                pass
-
-            out["ok"] = True
-            return out
-        except Exception as ex:
-            out["note"] = f"NVML error: {type(ex).__name__}"
-            return out
-
-    def _read_nvidia_smi(self, out: dict[str, Any]) -> dict[str, Any]:
-        cmd = "nvidia-smi --query-gpu=name,utilization.gpu,utilization.memory,temperature.gpu,memory.used,memory.total --format=csv,noheader,nounits"
-        code, txt = _sh(cmd, timeout=3)
-        if code != 0 or not txt:
-            out["note"] = "nvidia-smi query failed"
-            return out
-
-        line = txt.splitlines()[0].strip()
-        parts = [x.strip() for x in line.split(",")]
-        try:
-            out["name"] = parts[0] if len(parts) > 0 else ""
-            out["util_gpu"] = float(parts[1]) if len(parts) > 1 and parts[1] else None
-            out["util_mem"] = float(parts[2]) if len(parts) > 2 and parts[2] else None
-            out["temp"] = float(parts[3]) if len(parts) > 3 and parts[3] else None
-
-            # memory in MiB (nounits)
-            if len(parts) > 5:
-                used_mib = float(parts[4]) if parts[4] else 0.0
-                total_mib = float(parts[5]) if parts[5] else 0.0
-                out["mem_used"] = int(used_mib * 1024**2)
-                out["mem_total"] = int(total_mib * 1024**2)
-
-            out["ok"] = True
-        except Exception as ex:
-            out["note"] = f"parse error: {type(ex).__name__}"
-        return out
-
-    def _read_sysfs(self, out: dict[str, Any]) -> dict[str, Any]:
-        root = Path("/sys/class/drm")
-        if not root.exists():
-            out["note"] = "no /sys/class/drm"
-            return out
-
-        # choose card0 else first card*
-        candidates = sorted([c for c in root.glob("card*") if c.is_dir()])
-        chosen = None
-        for c in candidates:
-            if c.name == "card0":
-                chosen = c
-                break
-        if chosen is None and candidates:
-            chosen = candidates[0]
-        if chosen is None:
-            out["note"] = "no drm cards"
-            return out
-
-        dev = chosen / "device"
-        if not dev.exists():
-            out["note"] = "card has no device"
-            return out
-
-        util_file = None
-        if (dev / "gpu_busy_percent").exists():
-            util_file = dev / "gpu_busy_percent"
-        else:
-            try:
-                for f in sorted(dev.iterdir()):
-                    if f.is_file() and f.name.endswith("busy_percent"):
-                        util_file = f
-                        break
-            except Exception:
-                util_file = None
-
-        if util_file and util_file.exists():
-            v = _read_float(util_file)
-            if v is not None:
-                out["util_gpu"] = float(v)
-                out["ok"] = True
-
-        # name hint via lspci if possible
-        if shutil.which("lspci"):
-            try:
-                pci_addr = os.path.basename(os.readlink(str(dev)))
-            except Exception:
-                pci_addr = ""
-            if pci_addr:
-                code, t = _sh(f"lspci -s {pci_addr} | cut -d: -f3-", timeout=2)
-                if code == 0 and t:
-                    out["name"] = t.strip()
-
-        out["note"] = out["note"] or f"{chosen.name} util={out.get('util_gpu')}"
-        return out
+    return None
 
 
 # ==========================================================
-# 4) FEATURES: SENSORS, BATTERY, DISK, NETWORK
+# 5) GPU READER (sysfs preferred, nvidia-smi fallback)
+# ==========================================================
+
+class GPUReader:
+    """
+    GPU usage (opsional) dengan beberapa backend:
+    1) sysfs: /sys/class/drm/card*/device/gpu_busy_percent
+       - sering tersedia pada Intel/AMD.
+    2) nvidia-smi: query utilization.gpu (NVIDIA).
+    """
+
+    @staticmethod
+    def _sysfs_gpu_busy_candidates() -> List[Path]:
+        root = Path("/sys/class/drm")
+        if not root.exists():
+            return []
+        cand: List[Path] = []
+        for c in sorted(root.glob("card[0-9]*")):
+            p = c / "device" / "gpu_busy_percent"
+            if p.exists():
+                cand.append(p)
+        return cand
+
+    @staticmethod
+    def _read_sysfs_busy() -> Optional[float]:
+        for p in GPUReader._sysfs_gpu_busy_candidates():
+            v = _read_float(p)
+            if isinstance(v, (int, float)):
+                # choose first valid (usually card0)
+                return float(v)
+        return None
+
+    @staticmethod
+    def _read_nvidia_smi_busy() -> Optional[float]:
+        if not shutil.which("nvidia-smi"):
+            return None
+        # query utilization.gpu without headers
+        code, out = _sh("nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -n 1", timeout=2)
+        if code != 0 or not out:
+            return None
+        try:
+            return float(out.strip())
+        except Exception:
+            return None
+
+    @staticmethod
+    def read_usage_pct() -> dict[str, Any]:
+        """
+        Return:
+          { ok, pct, backend }
+        """
+        v = GPUReader._read_sysfs_busy()
+        if v is not None:
+            return {"ok": True, "pct": float(v), "backend": "sysfs(gpu_busy_percent)"}
+
+        v2 = GPUReader._read_nvidia_smi_busy()
+        if v2 is not None:
+            return {"ok": True, "pct": float(v2), "backend": "nvidia-smi"}
+
+        return {"ok": False, "pct": None, "backend": "none"}
+
+    @staticmethod
+    def gpu_name_hint() -> str:
+        if not shutil.which("lspci"):
+            return ""
+        code, out = _sh("lspci | grep -iE 'vga|3d|display' | head -n 1", timeout=3)
+        if code != 0 or not out:
+            return ""
+        return out.split(": ", 1)[-1].strip()
+
+
+# ==========================================================
+# 6) PING SAMPLER (background, HUD-friendly)
+# ==========================================================
+
+class PingSampler:
+    """
+    Background sampler untuk ping latency + jitter.
+    Tidak memblokir render HUD.
+    """
+    def __init__(self, target: str, interval: float = 5.0) -> None:
+        self.target = target
+        self.interval = float(_clamp(interval, 1.0, 30.0))
+        self.last_ms: Optional[float] = None
+        self.window: deque[float] = deque(maxlen=20)
+        self._stop = threading.Event()
+        self._thr = threading.Thread(target=self._run, daemon=True)
+
+    def start(self) -> None:
+        if not self._thr.is_alive():
+            self._thr.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def jitter(self) -> Optional[float]:
+        if len(self.window) < 3:
+            return None
+        return max(self.window) - min(self.window)
+
+    def _ping_once(self) -> Optional[float]:
+        if not shutil.which("ping"):
+            return None
+        try:
+            out = subprocess.check_output(
+                ["ping", "-c", "1", "-W", "1", self.target],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+            )
+            if "time=" in out:
+                s = out.split("time=", 1)[1].split()[0]
+                return float(s)
+        except Exception:
+            return None
+        return None
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            t0 = time.time()
+            ms = self._ping_once()
+            if ms is not None:
+                self.last_ms = ms
+                self.window.append(ms)
+            else:
+                self.last_ms = None
+
+            dt = time.time() - t0
+            wait = self.interval - dt
+            if wait > 0:
+                self._stop.wait(wait)
+
+
+# ==========================================================
+# 7) FEATURES: SENSORS, BATTERY, DISK, NETWORK
 # ==========================================================
 
 def run_sensors_dump() -> int:
     ansi.print_system("SENSORS INVENTORY (FULL DISCOVERY MODE)")
 
-    # tooling detect
     tools = SensorProbe.tool_presence()
     print(f"\n{ansi.c_bold()}[ TOOLING DETECT ]{ansi.c_reset()}")
     for k, ok in tools.items():
         mark = f"{ansi.c_green()}OK ✅{ansi.c_reset()}" if ok else f"{ansi.c_yellow()}MISSING ⚠{ansi.c_reset()}"
-        print(f"  - {k:<24}: {mark}")
+        print(f"  - {k:<28}: {mark}")
 
     print(f"\n{ansi.c_dim()}Rekomendasi Fedora (opsional):{ansi.c_reset()}")
-    print("  sudo dnf install -y lm_sensors smartmontools pciutils iw iproute")
-    print("  sudo dnf install -y python3-psutil  (wajib)")
-    print("  pip install pynvml  (opsional, NVIDIA util lebih stabil)")
+    print("  sudo dnf install lm_sensors smartmontools pciutils iw iproute")
 
-    # psutil
     print(f"\n{ansi.c_bold()}[ PSUTIL PROBE ]{ansi.c_reset()}")
     if psutil is None:
         ansi.print_brief_error("psutil belum terpasang — MON tidak bisa jalan tanpa ini.")
@@ -1141,7 +1025,6 @@ def run_sensors_dump() -> int:
     v = ov.get("psutil", {})
     print(f"  psutil       : {('OK ✅' if v.get('ok') else 'FAIL ❌')} (v{v.get('version', '?')})")
 
-    # temperature keys + sample
     print(f"\n{ansi.c_bold()}[ TEMPERATURE KEYS ]{ansi.c_reset()}")
     keys = ov.get("temps_keys", [])
     if not keys:
@@ -1155,14 +1038,13 @@ def run_sensors_dump() -> int:
             if not entries:
                 print("    (no entries)")
                 continue
-            for e in entries[:12]:
+            for e in entries[:16]:
                 lab = (e.get("label") or "-").strip()
                 cur = e.get("current")
                 hi = e.get("high")
                 cr = e.get("critical")
                 print(f"    - {lab:<18} cur={cur}°C  high={hi}  crit={cr}")
 
-    # fan keys + sample
     print(f"\n{ansi.c_bold()}[ FAN KEYS ]{ansi.c_reset()}")
     fkeys = ov.get("fans_keys", [])
     if not fkeys:
@@ -1176,12 +1058,11 @@ def run_sensors_dump() -> int:
             if not entries:
                 print("    (no entries)")
                 continue
-            for e in entries[:12]:
+            for e in entries[:16]:
                 lab = (e.get("label") or "-").strip()
                 cur = e.get("current")
                 print(f"    - {lab:<18} rpm={cur}")
 
-    # power_supply sysfs tree
     print(f"\n{ansi.c_bold()}[ POWER_SUPPLY SYSFS ]{ansi.c_reset()}")
     tree = SensorProbe.sysfs_power_supply_tree()
     if not tree.get("exists"):
@@ -1190,67 +1071,48 @@ def run_sensors_dump() -> int:
         items = tree.get("items", [])
         if not items:
             print("  (tidak ada entry)")
-        for it in items:
-            name = it.get("name", "?")
-            fields = it.get("fields", [])
-            print(f"\n  {ansi.c_cyan()}{name}{ansi.c_reset()}  {ansi.c_dim()}({len(fields)} fields){ansi.c_reset()}")
-            cols, _ = ansi.term_size()
-            line = ""
-            for f in fields:
-                piece = f"{f}  "
-                if len(line) + len(piece) >= min(cols, 120):
+        else:
+            for it in items:
+                name = it.get("name", "?")
+                fields = it.get("fields", [])
+                print(f"\n  {ansi.c_cyan()}{name}{ansi.c_reset()}  {ansi.c_dim()}({len(fields)} fields){ansi.c_reset()}")
+                cols, _ = ansi.term_size()
+                line = ""
+                for f in fields:
+                    piece = f"{f}  "
+                    if len(line) + len(piece) >= min(cols, 120):
+                        print("    " + line.rstrip())
+                        line = piece
+                    else:
+                        line += piece
+                if line.strip():
                     print("    " + line.rstrip())
-                    line = piece
-                else:
-                    line += piece
-            if line.strip():
-                print("    " + line.rstrip())
 
-    # drm gpu sysfs
-    print(f"\n{ansi.c_bold()}[ DRM GPU SYSFS ]{ansi.c_reset()}")
-    g = SensorProbe.sysfs_drm_gpu_tree()
-    if not g.get("exists"):
+    print(f"\n{ansi.c_bold()}[ DRM GPU (sysfs) ]{ansi.c_reset()}")
+    drm = SensorProbe.sysfs_drm_gpu_busy()
+    if not drm.get("exists"):
         print("  /sys/class/drm tidak ada.")
     else:
-        cards = g.get("cards", [])
+        cards = drm.get("cards", [])
         if not cards:
-            print("  (tidak ada card*)")
-        for c in cards[:8]:
-            print(f"\n  {ansi.c_cyan()}{c.get('card')}{ansi.c_reset()}  {ansi.c_dim()}{c.get('device')}{ansi.c_reset()}")
-            bc = c.get("busy_candidates", [])
-            if bc:
-                print(f"    busy candidates: {', '.join(bc[:8])}")
-            else:
-                print("    busy candidates: (none)")
+            print("  (no card entries)")
+        else:
+            for c in cards:
+                ex = "yes" if c.get("gpu_busy_percent_exists") else "no"
+                print(f"  - {c.get('card')} gpu_busy_percent={ex}  vendor={c.get('vendor')} device={c.get('device')}")
 
-    # block stats
-    print(f"\n{ansi.c_bold()}[ BLOCK STATS (DISK I/O) ]{ansi.c_reset()}")
-    b = SensorProbe.sysfs_block_tree(limit=20)
-    if not b.get("exists"):
+    print(f"\n{ansi.c_bold()}[ SYSFS BLOCK STAT ]{ansi.c_reset()}")
+    blk = SensorProbe.sysfs_block_stat_inventory()
+    if not blk.get("exists"):
         print("  /sys/block tidak ada.")
     else:
-        for dev in b.get("devices", []):
-            name = dev.get("name")
-            hs = dev.get("has_stat")
-            ss = dev.get("sector_size") or "?"
-            print(f"  - {name:<10} stat={'OK' if hs else 'NO'}  sector={ss}")
+        devs = blk.get("devices", [])
+        for d in devs[:40]:
+            print(f"  - {d.get('name'):<10} stat={d.get('stat_exists')} sector={d.get('sector_size') or '-'}")
+        if len(devs) > 40:
+            print(f"  {ansi.c_dim()}...({len(devs)-40} lainnya){ansi.c_reset()}")
 
-    # gpu reader quick test
-    print(f"\n{ansi.c_bold()}[ GPU READER TEST ]{ansi.c_reset()}")
-    gr = GPUReader()
-    r = gr.read()
-    print(f"  backend       : {r.get('backend')}")
-    if r.get("ok"):
-        print(f"  name          : {r.get('name') or '-'}")
-        print(f"  util_gpu      : {r.get('util_gpu')}%")
-        if r.get("util_mem") is not None:
-            print(f"  util_mem      : {r.get('util_mem')}%")
-        if r.get("temp") is not None:
-            print(f"  temp          : {r.get('temp')}°C")
-    else:
-        print(f"  status        : N/A  {ansi.c_dim()}{r.get('note','')}{ansi.c_reset()}")
-
-    print(f"\n{ansi.c_dim()}Tip:{ansi.c_reset()} data HUD paling berguna: CPU package, NVMe composite, watt/volt/amp, disk util% + R/W, wifi ssid/signal, ping latency/jitter, GPU util.")
+    print(f"\n{ansi.c_dim()}Tip:{ansi.c_reset()} HUD paling berguna: CPU package, NVMe composite, watt/volt/amp, swap, disk active%+R/W, gpu%, wifi ssid/signal, throughput, ping/jitter.")
     return 0
 
 
@@ -1268,7 +1130,6 @@ def run_battery_check() -> int:
     model = cap.get("model") or live.get("batt_name") or "BAT"
     print(f"\n{ansi.tag(str(model), ansi.c_cyan())}")
 
-    # Health
     if cap.get("ok"):
         health = float(cap["health_pct"])
         full = float(cap["full"])
@@ -1280,7 +1141,6 @@ def run_battery_check() -> int:
         print(f"  Health        : {col}{health:.2f}%{ansi.c_reset()}  {ansi.c_dim()}(usable vs design){ansi.c_reset()}")
         print(f"  Capacity      : {full:.2f}/{design:.2f} {unit}   Cycles: {cyc}")
 
-        # Snapshot history (consistent keys)
         s1 = snapshot_metric("battery", str(model), "health_pct", round(health, 2))
         s2 = snapshot_metric("battery", str(model), "capacity_full", round(full, 2))
 
@@ -1295,7 +1155,6 @@ def run_battery_check() -> int:
     else:
         print(f"  {ansi.c_yellow()}Info:{ansi.c_reset()} kapasitas/design tidak tersedia di sysfs, hanya tampilkan live-power.")
 
-    # Live power
     if live.get("ok"):
         pct = live.get("percent")
         st = str(live.get("status_raw") or "Unknown")
@@ -1312,9 +1171,6 @@ def run_battery_check() -> int:
 
 
 def _lsblk_disks() -> list[dict[str, str]]:
-    """
-    Robust lsblk (JSON) to detect disks (exclude loop/zram).
-    """
     cmd = "lsblk -J -d -o NAME,MODEL,SIZE,TYPE,TRAN,ROTA"
     code, out = _sh(cmd, timeout=3)
     if code != 0 or not out:
@@ -1327,7 +1183,7 @@ def _lsblk_disks() -> list[dict[str, str]]:
             if x.get("type") != "disk":
                 continue
             name = str(x.get("name") or "")
-            if name.startswith(("loop", "zram", "sr")):
+            if name.startswith("loop") or name.startswith("zram") or name.startswith("sr"):
                 continue
             res.append({
                 "name": name,
@@ -1340,11 +1196,7 @@ def _lsblk_disks() -> list[dict[str, str]]:
     except Exception:
         return []
 
-
 def _parse_smart_health(smart_a: str, smart_h: str) -> dict[str, Any]:
-    """
-    Parse smartctl output (NVMe + SATA fallback).
-    """
     out: dict[str, Any] = {
         "health": "Unknown",
         "health_color": ansi.c_dim(),
@@ -1354,7 +1206,6 @@ def _parse_smart_health(smart_a: str, smart_h: str) -> dict[str, Any]:
         "has_writes": False,
     }
 
-    # NVMe: Percentage Used => health = 100 - used
     for ln in smart_a.splitlines():
         if "Percentage Used" in ln:
             try:
@@ -1365,7 +1216,6 @@ def _parse_smart_health(smart_a: str, smart_h: str) -> dict[str, Any]:
             except Exception:
                 pass
 
-        # Temperature: NVMe variants
         if "Temperature:" in ln and "Celsius" in ln:
             try:
                 t = ln.split("Temperature:", 1)[1].replace("Celsius", "").strip()
@@ -1373,7 +1223,6 @@ def _parse_smart_health(smart_a: str, smart_h: str) -> dict[str, Any]:
             except Exception:
                 pass
 
-        # SATA style "194 Temperature_Celsius ..."
         if ("Temperature" in ln or "Celsius" in ln) and ("Airflow" not in ln):
             try:
                 toks = ln.split()
@@ -1388,7 +1237,6 @@ def _parse_smart_health(smart_a: str, smart_h: str) -> dict[str, Any]:
             except Exception:
                 pass
 
-        # NVMe TBW: Data Units Written ... [x.xx TB]
         if "Data Units Written" in ln and "[" in ln and "]" in ln:
             try:
                 raw = ln.split("[", 1)[1].split("]", 1)[0].strip()
@@ -1401,7 +1249,6 @@ def _parse_smart_health(smart_a: str, smart_h: str) -> dict[str, Any]:
             except Exception:
                 pass
 
-        # SATA TBW: Total_LBAs_Written
         if "Total_LBAs_Written" in ln:
             try:
                 lba = int(ln.split()[-1])
@@ -1411,7 +1258,6 @@ def _parse_smart_health(smart_a: str, smart_h: str) -> dict[str, Any]:
             except Exception:
                 pass
 
-    # SATA fallback health from -H
     if out["health"] == "Unknown":
         if "PASSED" in smart_h:
             out["health"] = "PASSED"
@@ -1421,7 +1267,6 @@ def _parse_smart_health(smart_a: str, smart_h: str) -> dict[str, Any]:
             out["health_color"] = ansi.c_red()
 
     return out
-
 
 def run_disk_check(argv: list[str]) -> int:
     ansi.print_system("STORAGE HEALTH (INTELLIGENT MODE)")
@@ -1493,13 +1338,11 @@ def _pick_default_target(user_target: str | None) -> str:
     t = (user_target or "").strip()
     return t if t else "google.com"
 
-
 def _ip_of_target(target: str) -> str:
     try:
         return socket.gethostbyname(target)
     except Exception:
         return "-"
-
 
 def _list_ifaces_summary() -> list[dict[str, str]]:
     if psutil is None:
@@ -1528,7 +1371,6 @@ def _list_ifaces_summary() -> list[dict[str, str]]:
         rows.append({"iface": iface, "up": up, "ip": ip})
     return rows
 
-
 def run_net_diag(argv: list[str]) -> int:
     if psutil is None:
         ansi.print_brief_error("Fitur net butuh psutil.")
@@ -1549,7 +1391,6 @@ def run_net_diag(argv: list[str]) -> int:
     target = _pick_default_target(target)
     ansi.print_system(f"NETWORK DIAGNOSTICS -> {target}")
 
-    # local interfaces
     print(f"\n{ansi.c_bold()}[ LOCAL INTERFACES ]{ansi.c_reset()}")
     rows = _list_ifaces_summary()
     if not rows:
@@ -1559,7 +1400,6 @@ def run_net_diag(argv: list[str]) -> int:
             col = ansi.c_green() if r["up"] == "UP" else ansi.c_red()
             print(f"  • {ansi.c_cyan()}{r['iface']:<8}{ansi.c_reset()} : {col}{r['up']:<4}{ansi.c_reset()} | {r['ip']}")
 
-    # wifi detail
     w = WiFiReader.read()
     if w.get("ok"):
         ssid = w.get("ssid") or "-"
@@ -1574,7 +1414,6 @@ def run_net_diag(argv: list[str]) -> int:
         if w.get("tx_bitrate"):
             print(f"  TX BITRATE    : {w.get('tx_bitrate')}")
 
-    # ping quality
     ip = _ip_of_target(target)
     print(f"\n{ansi.c_bold()}[ CONNECTION QUALITY ]{ansi.c_reset()}")
     print(f"  Target IP     : {ip}")
@@ -1607,7 +1446,6 @@ def run_net_diag(argv: list[str]) -> int:
     else:
         print(f"  Result        : {ansi.c_red()}TIMEOUT/RTO ❌{ansi.c_reset()}  {ansi.c_dim()}(host unreachable / ICMP blocked){ansi.c_reset()}")
 
-    # DNS check
     print(f"\n{ansi.c_bold()}[ DNS CHECK ]{ansi.c_reset()}")
     try:
         ip2 = socket.gethostbyname(target)
@@ -1620,9 +1458,6 @@ def run_net_diag(argv: list[str]) -> int:
 
 
 def run_net_live(argv: list[str]) -> int:
-    """
-    Live ping graph in alt-screen.
-    """
     target = _pick_default_target(argv[0] if argv else "google.com")
     input_muter = ansi.MuteInputDuringWait()
 
@@ -1648,7 +1483,7 @@ def run_net_live(argv: list[str]) -> int:
                 if ms is None:
                     print(f"{ts:<10} {'TO':<10} {ansi.c_red()}X{ansi.c_reset()}")
                 else:
-                    cnt = int(ms / 8.0)  # 1 bar per ~8ms
+                    cnt = int(ms / 8.0)
                     cnt = int(_clamp(cnt, 1, 40))
                     col = ansi.c_green()
                     if ms > 50:
@@ -1668,13 +1503,10 @@ def run_net_live(argv: list[str]) -> int:
 
 
 # ==========================================================
-# 5) LIVE COCKPIT (HUD)
+# 8) LIVE COCKPIT (HUD V3)
 # ==========================================================
 
 def _disk_usage_root() -> dict[str, Any]:
-    """
-    Disk usage for '/' (useful & not noisy).
-    """
     try:
         du = shutil.disk_usage("/")
         used_pct = (du.used / du.total) * 100.0 if du.total else 0.0
@@ -1682,9 +1514,7 @@ def _disk_usage_root() -> dict[str, Any]:
     except Exception:
         return {"ok": False}
 
-
 def _uptime_str() -> str:
-    # prefer psutil.boot_time; fallback /proc/uptime
     if psutil is not None:
         try:
             secs = time.time() - float(psutil.boot_time())
@@ -1707,7 +1537,6 @@ def _uptime_str() -> str:
     except Exception:
         return "?"
 
-
 def _loadavg_str() -> str:
     try:
         la = os.getloadavg()
@@ -1715,208 +1544,51 @@ def _loadavg_str() -> str:
     except Exception:
         return "-"
 
-
-def _swap_info() -> dict[str, Any]:
-    out = {"ok": False, "pct": 0.0, "used": 0.0, "total": 0.0}
-    if psutil is None:
-        return out
-    try:
-        sw = psutil.swap_memory()
-        out["ok"] = True
-        out["pct"] = float(sw.percent)
-        out["used"] = float(sw.used)
-        out["total"] = float(sw.total)
-    except Exception:
-        pass
-    return out
-
-
-def _top_processes_snapshot() -> dict[str, str]:
-    """
-    Lightweight top CPU/MEM (sampled, not every frame ideally).
-    """
-    out = {"cpu": "-", "mem": "-"}
-    if psutil is None:
-        return out
-
-    try:
-        procs = []
-        for p in psutil.process_iter(attrs=["name", "cpu_percent", "memory_info"]):
-            procs.append(p.info)
-
-        # top mem
-        best_mem = None
-        for x in procs:
-            mi = x.get("memory_info")
-            rss = getattr(mi, "rss", 0) if mi else 0
-            if best_mem is None or rss > best_mem[0]:
-                best_mem = (rss, x.get("name") or "?")
-        if best_mem:
-            out["mem"] = f"{best_mem[1]} ({_human_bytes(best_mem[0])})"
-
-        # top cpu (cpu_percent may be stale but still helpful)
-        best_cpu = None
-        for x in procs:
-            c = float(x.get("cpu_percent") or 0.0)
-            if best_cpu is None or c > best_cpu[0]:
-                best_cpu = (c, x.get("name") or "?")
-        if best_cpu and best_cpu[0] > 0:
-            out["cpu"] = f"{best_cpu[1]} ({best_cpu[0]:.0f}%)"
-    except Exception:
-        return out
-
-    return out
-
-
-def _os_pretty_name() -> str:
-    p = Path("/etc/os-release")
-    if not p.exists():
-        return ""
-    raw = _read_text(p)
-    for ln in raw.splitlines():
-        if ln.startswith("PRETTY_NAME="):
-            return ln.split("=", 1)[1].strip().strip('"')
-    return ""
-
-
-def _kernel_str() -> str:
-    code, out = _sh("uname -r", timeout=2)
-    return out.strip() if code == 0 else ""
-
-
-def _arch_str() -> str:
-    code, out = _sh("uname -m", timeout=2)
-    return out.strip() if code == 0 else ""
-
-
 def _cpu_model() -> str:
+    # cached by caller
     code, out = _sh("cat /proc/cpuinfo | grep -m1 'model name' | cut -d: -f2-", timeout=2)
-    return out.strip() if code == 0 else ""
+    return out.strip() if code == 0 and out else ""
 
-
-def _gpu_hint() -> str:
-    if not shutil.which("lspci"):
+def _nvme_model_hint(dev: Optional[str]) -> str:
+    if not dev:
         return ""
-    code, out = _sh("lspci | grep -iE 'vga|3d|display' | head -n 1", timeout=3)
-    if code != 0 or not out:
-        return ""
-    return out.split(": ", 1)[-1].strip()
-
-
-def _nvme_model(dev: str) -> str:
     code, out = _sh(f"lsblk -d -n -o MODEL /dev/{dev} 2>/dev/null | head -n 1", timeout=2)
-    return out.strip() if code == 0 else ""
+    return out.strip() if code == 0 and out else ""
 
-
-def _pick_root_block_device() -> Optional[str]:
-    """
-    Determine base disk device for '/' mount.
-    Examples:
-      /dev/nvme0n1p2 -> nvme0n1
-      /dev/sda2      -> sda
-      /dev/mmcblk0p2 -> mmcblk0
-    """
+def _topmem_process() -> str:
+    if psutil is None:
+        return "-"
     try:
-        src = ""
-        with open("/proc/mounts", "r", encoding="utf-8", errors="replace") as f:
-            for ln in f:
-                parts = ln.split()
-                if len(parts) >= 2 and parts[1] == "/":
-                    src = parts[0]
-                    break
-        if not src.startswith("/dev/"):
-            return None
-
-        real = os.path.realpath(src)
-        base = os.path.basename(real)
-
-        # nvme0n1p2 -> nvme0n1
-        if base.startswith("nvme") and "p" in base:
-            import re
-            m = re.match(r"^(nvme\d+n\d+)p\d+$", base)
-            if m:
-                return m.group(1)
-
-        # mmcblk0p2 -> mmcblk0
-        if base.startswith("mmcblk") and "p" in base:
-            import re
-            m = re.match(r"^(mmcblk\d+)p\d+$", base)
-            if m:
-                return m.group(1)
-
-        # sda2 -> sda (generic letters+digits)
-        import re
-        m = re.match(r"^([a-zA-Z]+)\d+$", base)
-        if m:
-            return m.group(1)
-
-        return base
+        best = None
+        for p in psutil.process_iter(attrs=["name", "memory_info"]):
+            mi = p.info.get("memory_info")
+            rss = getattr(mi, "rss", 0) if mi else 0
+            if best is None or rss > best[0]:
+                best = (rss, p.info.get("name") or "?")
+        if not best:
+            return "-"
+        return f"{best[1]} ({best[0]/(1024**3):.1f}GB)"
     except Exception:
-        return None
-
-
-def _fallback_first_nvme_or_disk() -> Optional[str]:
-    try:
-        root = Path("/sys/block")
-        if root.exists():
-            devs = sorted([p.name for p in root.iterdir() if p.is_dir()])
-            devs = [d for d in devs if not d.startswith(("loop", "zram", "ram", "sr"))]
-            nv = [d for d in devs if d.startswith("nvme")]
-            if nv:
-                return nv[0]
-            if devs:
-                return devs[0]
-    except Exception:
-        pass
-
-    code, out = _sh("lsblk -d -n -o NAME,TYPE | awk '$2==\"disk\"{print $1; exit}'", timeout=2)
-    if code == 0 and out:
-        return out.strip()
-    return None
-
-
-class HardwareCache:
-    """
-    Cache expensive calls for footer (uname/os-release/lsblk/lspci).
-    """
-    def __init__(self):
-        self.last = 0.0
-        self.every = 30.0
-        self.data: dict[str, str] = {}
-
-    def update(self, disk_dev: Optional[str]) -> None:
-        if time.time() - self.last < self.every:
-            return
-        self.last = time.time()
-        self.data["os"] = _os_pretty_name()
-        self.data["kernel"] = _kernel_str()
-        self.data["arch"] = _arch_str()
-        self.data["cpu"] = _cpu_model()
-        self.data["gpu"] = _gpu_hint()
-        self.data["nvme"] = _nvme_model(disk_dev) if disk_dev else ""
-
+        return "-"
 
 def run_live_cockpit(argv: list[str]) -> int:
     """
-    HUD realtime. Default interval 1.0s
+    HUD realtime.
 
     Options:
       --interval N   (float)
-      --compact      (lebih ringkas)
-      --no-ping      (disable ping sampler di HUD)
-      --target HOST  (ping target untuk HUD)
-      --iface IFACE  (throughput per interface)
+      --compact
+      --target HOST  (ping sampler target, default google.com)
+      --iface IFACE  (net speedometer per NIC)
     """
     if psutil is None:
         ansi.print_brief_error("Fitur Monitoring butuh library 'psutil'.")
         print("Install Fedora: sudo dnf install python3-psutil")
         return 1
 
-    # parse options
     interval = 1.0
     compact = False
-    ping_enabled = True
-    ping_target = "8.8.8.8"
+    target = "google.com"
     iface: Optional[str] = None
 
     i = 0
@@ -1924,22 +1596,20 @@ def run_live_cockpit(argv: list[str]) -> int:
         a = argv[i]
         if a in ("--compact", "compact"):
             compact = True
-        elif a == "--no-ping":
-            ping_enabled = False
         elif a == "--interval" and i + 1 < len(argv):
             try:
                 interval = float(argv[i + 1])
-                i += 1
             except Exception:
                 pass
+            i += 1
         elif a == "--target" and i + 1 < len(argv):
-            ping_target = argv[i + 1].strip() or ping_target
+            target = argv[i + 1].strip() or target
             i += 1
         elif a == "--iface" and i + 1 < len(argv):
             iface = argv[i + 1].strip() or None
             i += 1
         else:
-            # allow `ai mon live 0.5`
+            # numeric shortcut: ai mon live 0.5
             if i == 0:
                 try:
                     interval = float(a)
@@ -1948,46 +1618,39 @@ def run_live_cockpit(argv: list[str]) -> int:
         i += 1
 
     interval = float(_clamp(interval, 0.2, 5.0))
+    target = _pick_default_target(target)
 
     pr = PowerReader()
     ns = NetSpeedometer(iface=iface)
     ns.update()
 
-    # disk io meter: choose root disk
-    disk_dev = _pick_root_block_device() or _fallback_first_nvme_or_disk()
-    disk_io = DiskIOMeter(disk_dev) if disk_dev else None
+    disk_dev = _pick_root_disk_dev()
+    disk_io = DiskIOSampler(disk_dev) if disk_dev else None
 
-    # gpu
-    gr = GPUReader()
+    ping = PingSampler(target=target, interval=max(2.0, interval * 2.0))
+    ping.start()
 
-    # ping sampler
-    pinger = PingSampler(ping_target, interval=5.0) if ping_enabled else None
-    if pinger:
-        pinger.start()
-
-    # history snapshot throttle
+    # caches/throttles
     last_snap = 0.0
-    SNAP_EVERY = 600.0  # 10 min
+    SNAP_EVERY = 600.0
 
-    # process sampling throttle
-    last_proc = 0.0
-    PROC_EVERY = 5.0
-    proc_info = {"cpu": "-", "mem": "-"}
+    last_hw = 0.0
+    HW_EVERY = 30.0
+    hw_cpu = ""
+    hw_gpu = ""
+    hw_nvme = ""
+    distro = _distro_pretty()
+    kernel = _uname_kernel()
 
-    # wifi sampling throttle
-    last_wifi = 0.0
-    WIFI_EVERY = 4.0
-    wifi_info: dict[str, Any] = {"ok": False}
-
-    # hardware footer cache
-    hw = HardwareCache()
-    hw.update(disk_dev)
+    last_top = 0.0
+    TOP_EVERY = 5.0
+    topmem = "-"
 
     input_muter = ansi.MuteInputDuringWait()
     ansi.alt_screen_enter()
     ansi.cursor_hide()
+
     try:
-        # prime cpu_percent
         try:
             psutil.cpu_percent(interval=None)
         except Exception:
@@ -1996,13 +1659,12 @@ def run_live_cockpit(argv: list[str]) -> int:
         with input_muter:
             while True:
                 cols, _rows = ansi.term_size()
-                usable = min(cols, 110)
 
-                # --- collect core metrics ---
+                # core metrics
                 try:
-                    cpu_pct = float(psutil.cpu_percent(interval=None))
+                    cpu = float(psutil.cpu_percent(interval=None))
                 except Exception:
-                    cpu_pct = 0.0
+                    cpu = 0.0
 
                 try:
                     vm = psutil.virtual_memory()
@@ -2012,50 +1674,35 @@ def run_live_cockpit(argv: list[str]) -> int:
                 except Exception:
                     ram_pct, ram_used, ram_total = 0.0, 0.0, 0.0
 
-                sw = _swap_info()
+                sw = SwapReader.read()
 
                 temps = ThermalReader.read_key_temps()
                 fan = ThermalReader.read_fan_rpm()
                 power = pr.read()
                 du = _disk_usage_root()
+                wifi = WiFiReader.read()
 
-                # net throughput
                 ns.update()
 
-                # disk io
                 if disk_io:
                     disk_io.update()
 
-                # gpu
-                gpu_state = gr.read()
+                # gpu usage
+                gpu = GPUReader.read_usage_pct()
 
-                # ping metrics
-                ping_ms = pinger.last_ms if pinger else None
-                ping_jit = pinger.jitter() if pinger else None
+                # throttled topmem
+                if time.time() - last_top >= TOP_EVERY:
+                    topmem = _topmem_process()
+                    last_top = time.time()
 
-                # process sampling occasionally
-                if time.time() - last_proc >= PROC_EVERY:
-                    proc_info = _top_processes_snapshot()
-                    last_proc = time.time()
+                # throttled hardware footer
+                if time.time() - last_hw >= HW_EVERY:
+                    hw_cpu = _cpu_model()
+                    hw_gpu = GPUReader.gpu_name_hint()
+                    hw_nvme = _nvme_model_hint(disk_dev)
+                    last_hw = time.time()
 
-                # wifi sampling
-                if time.time() - last_wifi >= WIFI_EVERY:
-                    wifi_info = WiFiReader.read()
-                    last_wifi = time.time()
-
-                # periodic background snapshot (silent)
-                if time.time() - last_snap >= SNAP_EVERY:
-                    cap = pr.read_capacity_health()
-                    if cap.get("ok"):
-                        model = str(cap.get("model") or "BAT")
-                        snapshot_metric("battery", model, "health_pct", round(float(cap["health_pct"]), 2))
-                        snapshot_metric("battery", model, "capacity_full", round(float(cap["full"]), 2))
-                    last_snap = time.time()
-
-                # hardware cache update
-                hw.update(disk_dev)
-
-                # --- battery display logic ---
+                # battery logic
                 lvl = power.get("percent")
                 lvl_i = int(lvl) if isinstance(lvl, int) else None
                 st_raw = str(power.get("status_raw") or "Unknown")
@@ -2064,7 +1711,6 @@ def run_live_cockpit(argv: list[str]) -> int:
 
                 st_txt = "Unknown"
                 bat_col = ansi.c_green()
-
                 if plugged_b:
                     if st_raw.lower() == "full" or (lvl_i == 100):
                         st_txt = "AC (Full)"
@@ -2085,57 +1731,68 @@ def run_live_cockpit(argv: list[str]) -> int:
                     elif lvl_i is not None and lvl_i < 35:
                         bat_col = ansi.c_yellow()
 
-                # time left estimate
                 secs_left = power.get("secs_left")
                 eta = ""
-                if isinstance(secs_left, (int, float)) and secs_left > 0 and secs_left < 10**9:
+                if isinstance(secs_left, (int, float)) and 0 < secs_left < 10**9:
                     h = int(secs_left // 3600)
                     m = int((secs_left % 3600) // 60)
                     eta = f"{h}h {m}m left"
 
-                # --- render ---
+                # periodic background snapshot battery health
+                if time.time() - last_snap >= SNAP_EVERY:
+                    cap = pr.read_capacity_health()
+                    if cap.get("ok"):
+                        model = str(cap.get("model") or "BAT")
+                        snapshot_metric("battery", model, "health_pct", round(float(cap["health_pct"]), 2))
+                        snapshot_metric("battery", model, "capacity_full", round(float(cap["full"]), 2))
+                    last_snap = time.time()
+
+                # render
                 ansi.clear_screen()
 
                 title_left = f"{ansi.c_cyan()}{ansi.c_bold()} SYSTEM COCKPIT {ansi.c_reset()}"
                 title_right = f"{ansi.c_dim()}AI-Terminal{ansi.c_reset()}"
-                space = max(1, usable - (len(" SYSTEM COCKPIT ") + len("AI-Terminal") + 6))
-                print(f"{title_left}{' ' * space}{title_right}")
+                usable = min(cols, 110)
+                gap = max(1, usable - (len(" SYSTEM COCKPIT ") + len("AI-Terminal") + 6))
+                print(f"{title_left}{' ' * gap}{title_right}")
+
                 ts = _now_ts()
-                print(f"{ansi.c_dim()}{_safe_center(ts, min(usable, 80))}{ansi.c_reset()}")
-                print(f"{ansi.c_dim()}Uptime:{ansi.c_reset()} {_uptime_str()}   {ansi.c_dim()}Load:{ansi.c_reset()} {_loadavg_str()}")
-                print("-" * min(usable, 88))
+                print(f"{ansi.c_dim()}{ts.center(min(cols, 80))}{ansi.c_reset()}")
+                print(f"{ansi.c_dim()}Uptime:{ansi.c_reset()} {_uptime_str()}   {ansi.c_dim()}Load:{ansi.c_reset()} {_loadavg_str()}   {ansi.c_dim()}Kernel:{ansi.c_reset()} {kernel}")
+                if distro and not compact:
+                    print(f"{ansi.c_dim()}OS:{ansi.c_reset()} {distro}")
+                print("-" * min(cols, 90))
 
-                # CPU/RAM
-                print(f"{ansi.c_bold()} CPU {ansi.c_reset()} {_draw_bar(cpu_pct, 14)} {cpu_pct:>5.1f}%   {ansi.c_dim()}Top:{ansi.c_reset()} {proc_info.get('cpu','-')}")
-                print(f"{ansi.c_bold()} RAM {ansi.c_reset()} {_draw_bar(ram_pct, 14)} {ram_pct:>5.1f}%   {ram_used/(1024**3):.1f}/{ram_total/(1024**3):.1f} GB   {ansi.c_dim()}TopMem:{ansi.c_reset()} {proc_info.get('mem','-')}")
+                # CPU/RAM/SWAP/GPU bars
+                print(f"{ansi.c_bold()} CPU {ansi.c_reset()} {_draw_bar(cpu)} {cpu:>5.1f}%")
+                print(f"{ansi.c_bold()} RAM {ansi.c_reset()} {_draw_bar(ram_pct)} {ram_pct:>5.1f}%   {ram_used/(1024**3):.1f}/{ram_total/(1024**3):.1f} GB   {ansi.c_dim()}TopMem:{ansi.c_reset()} {topmem}")
 
-                # SWAP
-                if sw.get("ok") and float(sw.get("total", 0.0)) > 0:
-                    sp = float(sw["pct"])
-                    print(f"{ansi.c_bold()} SWAP{ansi.c_reset()} {_draw_bar(sp, 12)} {sp:>5.1f}%  {_human_bytes(float(sw['used']))}/{_human_bytes(float(sw['total']))}")
+                if sw.get("ok") and sw.get("total", 0) > 0:
+                    sw_pct = float(sw.get("pct", 0.0))
+                    sw_used = int(sw.get("used", 0))
+                    sw_total = int(sw.get("total", 0))
+                    print(f"{ansi.c_bold()} SWAP{ansi.c_reset()} {_draw_bar(sw_pct)} {sw_pct:>5.1f}%   {_human_bytes(sw_used)}/{_human_bytes(sw_total)}")
                 else:
-                    print(f"{ansi.c_bold()} SWAP{ansi.c_reset()} {ansi.c_dim()}N/A{ansi.c_reset()}")
+                    print(f"{ansi.c_bold()} SWAP{ansi.c_reset()} {ansi.c_dim()}(not available){ansi.c_reset()}")
 
-                # Disk usage (/)
+                if gpu.get("ok") and isinstance(gpu.get("pct"), (int, float)):
+                    gp = float(gpu["pct"])
+                    print(f"{ansi.c_bold()} GPU {ansi.c_reset()} {_draw_bar(gp)} {gp:>5.1f}%   {ansi.c_dim()}({gpu.get('backend')}){ansi.c_reset()}")
+                else:
+                    print(f"{ansi.c_bold()} GPU {ansi.c_reset()} {ansi.c_dim()}(no gpu usage sensor){ansi.c_reset()}")
+
+                # Disk usage / active time / rw speed
                 if du.get("ok"):
                     dp = float(du.get("used_pct", 0.0))
-                    print(f"{ansi.c_bold()} DISK{ansi.c_reset()} {_draw_bar(dp, 14)} {dp:>5.1f}%   /   {_human_bytes(float(du['used']))}/{_human_bytes(float(du['total']))}")
-
-                # Disk I/O line
-                if disk_io:
+                    print(f"{ansi.c_bold()} DISK{ansi.c_reset()} {_draw_bar(dp)} {dp:>5.1f}%   /   {_human_bytes(float(du['used']))}/{_human_bytes(float(du['total']))}")
+                if disk_io and disk_dev:
                     util = float(disk_io.active_pct)
-                    util_col = ansi.c_green() if util <= 60 else (ansi.c_yellow() if util <= 85 else ansi.c_red())
-                    print(
-                        f"{ansi.c_bold()} I/O {ansi.c_reset()} "
-                        f"{util_col}{util:>5.1f}% active{ansi.c_reset()}   "
-                        f"R:{_human_rate_bps(disk_io.read_bps):>10}  "
-                        f"W:{_human_rate_bps(disk_io.write_bps):>10}   "
-                        f"{ansi.c_dim()}({disk_dev}){ansi.c_reset()}"
-                    )
-                else:
-                    print(f"{ansi.c_bold()} I/O {ansi.c_reset()} {ansi.c_dim()}N/A{ansi.c_reset()}")
+                    col_u = ansi.c_green() if util <= 60 else (ansi.c_yellow() if util <= 85 else ansi.c_red())
+                    r = _human_rate_bps(disk_io.read_bps)
+                    w = _human_rate_bps(disk_io.write_bps)
+                    print(f"{ansi.c_bold()} I/O {ansi.c_reset()} {col_u}{util:>5.1f}%{ansi.c_reset()}  R:{r:<10}  W:{w:<10}  {ansi.c_dim()}({disk_dev}){ansi.c_reset()}")
 
-                print("-" * min(usable, 88))
+                print("-" * min(cols, 90))
 
                 # Temps / fan
                 cpu_t = temps.get("cpu")
@@ -2145,14 +1802,13 @@ def run_live_cockpit(argv: list[str]) -> int:
                 cpu_t_s = f"{cpu_t:.1f}°C" if isinstance(cpu_t, (int, float)) else "-"
                 ssd_t_s = f"{ssd_t:.1f}°C" if isinstance(ssd_t, (int, float)) else "-"
                 wifi_t_s = f"{wifi_t:.1f}°C" if isinstance(wifi_t, (int, float)) else "-"
-
                 fan_s = f"{int(fan)} RPM" if isinstance(fan, (int, float)) and fan else "-"
 
                 print(
                     f"{ansi.c_bold()} TEMP{ansi.c_reset()} "
-                    f"CPU:{_tcol(cpu_t)}{cpu_t_s}{ansi.c_reset()}   "
-                    f"NVMe:{_tcol(ssd_t)}{ssd_t_s}{ansi.c_reset()}   "
-                    f"WiFi:{_tcol(wifi_t)}{wifi_t_s}{ansi.c_reset()}   "
+                    f"CPU:{_col_by_temp(cpu_t)}{cpu_t_s}{ansi.c_reset()}   "
+                    f"NVMe:{_col_by_temp(ssd_t)}{ssd_t_s}{ansi.c_reset()}   "
+                    f"WiFi:{_col_by_temp(wifi_t)}{wifi_t_s}{ansi.c_reset()}   "
                     f"{ansi.c_dim()}Fan:{ansi.c_reset()} {fan_s}"
                 )
 
@@ -2165,93 +1821,49 @@ def run_live_cockpit(argv: list[str]) -> int:
                     f"{ansi.c_dim()}{eta}{ansi.c_reset()}"
                 )
 
-                # Network line + ping + wifi
+                # Network + ping line
                 rx = _human_rate_bps(ns.rx)
                 tx = _human_rate_bps(ns.tx)
 
-                ping_txt = "N/A"
-                if ping_enabled:
-                    if ping_ms is None:
-                        ping_txt = f"{ansi.c_red()}TO{ansi.c_reset()}"
-                    else:
-                        ping_txt = f"{_ping_col(ping_ms)}{ping_ms:>4.0f}ms{ansi.c_reset()}"
+                ping_ms = ping.last_ms
+                jit = ping.jitter()
+                ping_txt = "TO" if ping_ms is None else f"{ping_ms:.0f}ms"
+                jit_txt = "-" if jit is None else f"{jit:.0f}ms"
+                pcol = _col_by_ping(ping_ms)
 
-                jit_txt = ""
-                if ping_enabled:
-                    if ping_jit is None:
-                        jit_txt = f"{ansi.c_dim()}jit:-{ansi.c_reset()}"
-                    else:
-                        jit_txt = f"{ansi.c_dim()}jit:{ping_jit:>3.0f}ms{ansi.c_reset()}"
+                net_line = f"{ansi.c_bold()} NET {ansi.c_reset()} ↓{rx}  ↑{tx}   Ping:{pcol}{ping_txt}{ansi.c_reset()}  Jit:{ansi.c_dim()}{jit_txt}{ansi.c_reset()}"
+                if wifi.get("ok"):
+                    ssid = wifi.get("ssid") or "-"
+                    sig = wifi.get("signal_dbm")
+                    sig_txt = f"{sig:.0f} dBm" if isinstance(sig, (int, float)) else "-"
+                    net_line += f"   {ansi.c_dim()}WiFi:{ansi.c_reset()} {ssid} ({_col_by_dbm(sig)}{sig_txt}{ansi.c_reset()})"
+                print(net_line)
 
-                wifi_tail = ""
-                if wifi_info.get("ok"):
-                    ssid = wifi_info.get("ssid") or "-"
-                    sig = wifi_info.get("signal_dbm")
-                    sig_txt = f"{sig:.0f}dBm" if isinstance(sig, (int, float)) else "-"
-                    sig_col = _sigcol_dbm(sig if isinstance(sig, (int, float)) else None)
-                    rxbr = (wifi_info.get("rx_bitrate") or "")
-                    txbr = (wifi_info.get("tx_bitrate") or "")
-                    if len(rxbr) > 20:
-                        rxbr = rxbr[:20] + "…"
-                    if len(txbr) > 20:
-                        txbr = txbr[:20] + "…"
-                    wifi_tail = f"   {ansi.c_dim()}WiFi:{ansi.c_reset()} {ssid} {sig_col}{sig_txt}{ansi.c_reset()}"
-                    if rxbr or txbr:
-                        wifi_tail += f" {ansi.c_dim()}rx:{rxbr} tx:{txbr}{ansi.c_reset()}"
+                # Footer: hardware names
+                if not compact:
+                    hw_parts = []
+                    if hw_cpu:
+                        hw_parts.append(f"CPU: {hw_cpu.strip()[:52]}")
+                    if hw_nvme:
+                        hw_parts.append(f"NVMe: {hw_nvme.strip()[:40]}")
+                    if hw_gpu:
+                        hw_parts.append(f"GPU: {hw_gpu.strip()[:52]}")
+                    if hw_parts:
+                        print(f"{ansi.c_dim()}{' | '.join(hw_parts)}{ansi.c_reset()}")
 
-                print(f"{ansi.c_bold()} NET {ansi.c_reset()} ↓{rx:<10}  ↑{tx:<10}   ping:{ping_txt} {jit_txt}{wifi_tail}")
-
-                # GPU line
-                if gpu_state.get("ok") and gpu_state.get("util_gpu") is not None:
-                    u = float(gpu_state["util_gpu"])
-                    col = ansi.c_green() if u <= 60 else (ansi.c_yellow() if u <= 85 else ansi.c_red())
-                    mem_part = ""
-                    if gpu_state.get("mem_used") is not None and gpu_state.get("mem_total") is not None and gpu_state["mem_total"]:
-                        mu = float(gpu_state["mem_used"])
-                        mt = float(gpu_state["mem_total"])
-                        mem_part = f"  VRAM:{_human_bytes(mu)}/{_human_bytes(mt)}"
-                    temp_part = ""
-                    if gpu_state.get("temp") is not None:
-                        temp_part = f"  T:{float(gpu_state['temp']):.0f}°C"
-                    name = gpu_state.get("name") or ""
-                    if len(name) > 42:
-                        name = name[:42] + "…"
-                    print(f"{ansi.c_bold()} GPU {ansi.c_reset()} {col}{u:>5.1f}%{ansi.c_reset()}{mem_part}{temp_part}  {ansi.c_dim()}{name}{ansi.c_reset()}")
-                else:
-                    note = gpu_state.get("note") or "N/A"
-                    if len(note) > 60:
-                        note = note[:60] + "…"
-                    print(f"{ansi.c_bold()} GPU {ansi.c_reset()} {ansi.c_dim()}N/A{ansi.c_reset()}  {ansi.c_dim()}{note}{ansi.c_reset()}")
-
-                # Footer
                 print("")
                 if compact:
-                    print(f"{ansi.c_dim()}Ctrl+C untuk keluar. Tip: ai mon sensors (inventaris).{ansi.c_reset()}")
+                    print(f"{ansi.c_dim()}Ctrl+C untuk keluar. Tip: ai mon sensors{ansi.c_reset()}")
                 else:
-                    os_name = hw.data.get("os", "")
-                    kern = hw.data.get("kernel", "")
-                    arch = hw.data.get("arch", "")
-                    cpu_name = hw.data.get("cpu", "")
-                    nv = hw.data.get("nvme", "")
-                    gpn = hw.data.get("gpu", "")
-
-                    if os_name or kern or arch:
-                        print(f"{ansi.c_dim()}OS:{ansi.c_reset()} {os_name}  {ansi.c_dim()}Kernel:{ansi.c_reset()} {kern}  {ansi.c_dim()}Arch:{ansi.c_reset()} {arch}")
-                    if cpu_name:
-                        print(f"{ansi.c_dim()}CPU:{ansi.c_reset()} {cpu_name}")
-                    if nv:
-                        print(f"{ansi.c_dim()}NVMe:{ansi.c_reset()} {nv}")
-                    if gpn:
-                        print(f"{ansi.c_dim()}GPU:{ansi.c_reset()} {gpn}")
-
-                    print(f"{ansi.c_dim()}Ctrl+C untuk keluar.{ansi.c_reset()}  {ansi.c_dim()}Tip:{ansi.c_reset()} `ai mon sensors` untuk daftar sensor lengkap.  {ansi.c_dim()}Tip:{ansi.c_reset()} `sudo ai mon disk` untuk TBW/SMART detail.")
+                    print(f"{ansi.c_dim()}Ctrl+C untuk keluar.{ansi.c_reset()}  {ansi.c_dim()}Tip:{ansi.c_reset()} `ai mon sensors` untuk daftar sensor lengkap.")
+                    print(f"{ansi.c_dim()}Tip:{ansi.c_reset()} `sudo ai mon disk` untuk TBW/SMART detail.")
+                    print(f"{ansi.c_dim()}Tip:{ansi.c_reset()} `ai mon net` untuk diagnosa target + wifi detail.")
 
                 time.sleep(interval)
 
     except KeyboardInterrupt:
         pass
     except Exception as ex:
-        # Fail-safe agar terminal tidak “nyangkut”
         try:
             ansi.cursor_show()
             ansi.alt_screen_exit()
@@ -2261,8 +1873,10 @@ def run_live_cockpit(argv: list[str]) -> int:
         print(str(ex))
         return 1
     finally:
-        if pinger:
-            pinger.stop()
+        try:
+            ping.stop()
+        except Exception:
+            pass
         try:
             ansi.cursor_show()
             ansi.alt_screen_exit()
@@ -2273,7 +1887,7 @@ def run_live_cockpit(argv: list[str]) -> int:
 
 
 # ==========================================================
-# 6) ROUTER / ENTRYPOINT
+# 9) ROUTER / ENTRYPOINT
 # ==========================================================
 
 def handle(argv: list[str], cfg: dict) -> int:
@@ -2281,7 +1895,7 @@ def handle(argv: list[str], cfg: dict) -> int:
     Entry point: ai mon <mode> [args]
 
     Modes:
-      live [--interval N] [--compact] [--no-ping] [--target HOST] [--iface IFACE]
+      live [--interval N] [--compact] [--target HOST] [--iface IFACE]
       sensors
       batt
       disk [--sudo|--deep]
@@ -2297,24 +1911,26 @@ def handle(argv: list[str], cfg: dict) -> int:
         rest = argv[1:]
 
     if mode in ("help", "-h", "--help"):
-        ansi.print_info("AI Monitor (MON) — V3")
-        print("  ai mon live [--interval N] [--compact] [--no-ping] [--target HOST] [--iface IFACE] : HUD realtime (ANSI).")
-        print("  ai mon sensors                           : Daftar semua sensor/field yang bisa dibaca.")
-        print("  ai mon batt                              : Battery health + history (time travel).")
-        print("  ai mon disk [--sudo|--deep]              : Storage SMART/TBW + history.")
-        print("  ai mon net [target]                      : Network diagnostics (ping/dns + wifi detail).")
-        print("  ai mon net live [target]                 : Live ping graph (alt-screen).")
+        ansi.print_info("AI Monitor (MON)")
+        print("  ai mon live [--interval N] [--compact] [--target HOST] [--iface IFACE] : HUD realtime (ANSI).")
+        print("  ai mon sensors                                                      : Daftar semua sensor/field yang bisa dibaca.")
+        print("  ai mon batt                                                         : Battery health + history (time travel).")
+        print("  ai mon disk [--sudo|--deep]                                         : Storage SMART/TBW + history.")
+        print("  ai mon net [target]                                                 : Network diagnostics (ping/dns + wifi detail).")
+        print("  ai mon net live [target]                                            : Live ping graph (alt-screen).")
         print("")
         print("Dependency (Fedora):")
-        print("  sudo dnf install -y python3-psutil")
+        print("  sudo dnf install python3-psutil")
         print("Optional tools (Fedora):")
-        print("  sudo dnf install -y lm_sensors smartmontools pciutils iw iproute")
-        print("GPU (NVIDIA optional):")
-        print("  - nvidia-smi (biasanya ikut driver)")
-        print("  - pip install pynvml  (lebih stabil untuk utilization)")
+        print("  sudo dnf install lm_sensors smartmontools pciutils iw iproute")
+        print("Optional NVIDIA:")
+        print("  nvidia-smi (driver package)")
+        print("")
+        print("Catatan sudo PATH:")
+        print("  Jika `sudo ai ...` tidak ketemu, gunakan:")
+        print("    sudo env \"PATH=$PATH\" ai mon disk")
         return 0
 
-    # Modes that do NOT require psutil strictly
     if mode in ("sensors", "probe", "inventory"):
         return run_sensors_dump()
 
@@ -2333,7 +1949,6 @@ def handle(argv: list[str], cfg: dict) -> int:
         return run_disk_check(rest)
 
     if mode in ("net", "wifi", "ping"):
-        # support: ai mon net live <target>
         if rest and rest[0].lower() == "live":
             return run_net_live(rest[1:])
         return run_net_diag(rest)
