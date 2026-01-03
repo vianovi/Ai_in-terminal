@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 """
-ai_logic.ui.ansi
+ai_logic.ui.ansi Version 1
 
 Minimal, dependency-light ANSI UI utilities used across AI-Term tools (ask/mon/cmd).
 
@@ -489,27 +489,39 @@ class ChatSpinner:
 # ============================================================
 
 def _goodbye_lines(persona: str, interrupted: bool) -> list[str]:
-    if persona == "api":
+    """
+    Pesan penutup sesi yang selaras dengan persona:
+    - LOCAL: Sili AI (hangat, teman di terminal)
+    - API  : Sili Pintar (lebih romantis & dewasa)
+
+    Catatan:
+    - Emoji diperbolehkan (diminta user).
+    - Ctrl+C / interupsi diperlakukan sebagai 'interrupted=True'.
+    """
+    p = (persona or "").strip().lower()
+
+    # Persona: API (lebih romantis & dewasa)
+    if p == "api":
         if interrupted:
             return [
-                "Sili Pinter: Oke, kita stop dulu ya.",
-                "Kalau kamu mau lanjut nanti, panggil aku lagi.",
+                "Sili Pintar: Oke sayang… kita jeda dulu ya 💍✨",
+                "Kalau kamu siap lanjut, panggil aku lagi. Aku tetap di sini 🤍",
             ]
         return [
-            "Sili Pinter: Oke, sesi ngobrol kita aku tutup dulu ya.",
-            "Sampai ketemu lagi.",
+            "Sili Pintar: Makasih udah ngobrol sama aku… sampai ketemu lagi ya ❤️‍🔥🥀",
+            "Kalau kamu kangen atau butuh aku, tinggal panggil. Aku pasti nyaut 🤍",
         ]
 
+    # Persona default: LOCAL (hangat, friendly)
     if interrupted:
         return [
-            "Sili AI: Oke, aku tangkep. Kita stop dulu ya.",
-            "Kalau kamu mau lanjut nanti, panggil aku lagi.",
+            "Sili AI: Oke, kita pause dulu ya 😊🌿",
+            "Kalau kamu mau lanjut, tinggal panggil aku lagi. Aku standby ✨",
         ]
     return [
-        "Sili AI: Oke, sesi ngobrol kita aku tutup dulu ya.",
-        "Sampai ketemu lagi.",
+        "Sili AI: Oke, sesi kita aku tutup dulu ya. Makasih udah cerita 😊✨",
+        "Kapan pun kamu butuh teman di terminal, panggil aku lagi 🌿",
     ]
-
 
 def print_goodbye(persona: str, interrupted: bool) -> None:
     lines = _goodbye_lines(persona, interrupted)
