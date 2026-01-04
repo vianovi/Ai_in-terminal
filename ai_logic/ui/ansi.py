@@ -1,23 +1,26 @@
 from __future__ import annotations
 
 """
-ai_logic.ui.ansi Version 1
+ai_logic.ui.ansi
+Version: 1.5 (2026-01-04)
 
-Minimal, dependency-light ANSI UI utilities used across AI-Term tools (ask/mon/cmd).
+Changelog (1.5)
+- Added print_error() for stderr and aligned brief errors to stderr.
+- Added format_route_label(RouteInfo) to keep routing UI in UI layer.
+- Added optional ASCII/emoji toggle via env (AI_TERM_NO_EMOJI=1).
 
 Design goals
 - No heavy dependencies; pure stdlib.
 - Safe and predictable terminal behavior (alt screen, cursor state, input echo).
 - Works even when output is not a TTY (pipes, logs): gracefully degrades.
-- “Calm errors”: do not print scary stacktraces by default; provide actionable hints.
+- Calm errors: no stacktraces by default; provide actionable hints.
 
 Compatibility
 - Python 3.9+
 - Linux/macOS terminals. Windows is best-effort (colors may be disabled).
 
 Notes
-- This module intentionally exposes small, composable primitives rather than a “rich”
-  framework. Keep it boring and stable.
+- This module exposes small, composable primitives (not a rich TUI framework).
 """
 
 import os
@@ -60,13 +63,29 @@ def supports_color(stream: Any = sys.stdout) -> bool:
         return False
 
 
+def no_emoji() -> bool:
+    """Return True if unicode glyphs/emoji should be avoided.
+
+    Controlled by env: AI_TERM_NO_EMOJI=1 or AI_TERM_ASCII=1.
+    """
+    v = (os.environ.get('AI_TERM_NO_EMOJI') or os.environ.get('AI_TERM_ASCII') or '').strip().lower()
+    return v in ('1', 'true', 'yes', 'on')
+
+def _emoji(glyph: str, fallback: str = '') -> str:
+    """Return glyph when unicode is allowed; otherwise fallback."""
+    return glyph if supports_unicode() else fallback
+
+
 def supports_unicode(stream: Any = sys.stdout) -> bool:
     """
-    Whether it is safe to output unicode glyphs (bars/spinners).
+    Whether it is safe to output unicode glyphs (bars/spinners/emoji).
+    Respects AI_TERM_NO_EMOJI=1 for ascii-only environments.
     """
     try:
-        enc = getattr(stream, "encoding", None) or ""
-        return "UTF" in enc.upper()
+        if no_emoji():
+            return False
+        enc = getattr(stream, 'encoding', None) or ''
+        return 'UTF' in enc.upper()
     except Exception:
         return False
 
@@ -106,6 +125,15 @@ def _safe_write(s: str) -> None:
 # ============================================================
 # Terminal control
 # ============================================================
+
+
+def _safe_write_err(s: str) -> None:
+    try:
+        sys.stderr.write(s)
+        sys.stderr.flush()
+    except Exception:
+        pass
+
 
 def alt_screen_enter() -> None:
     if not _isatty():
@@ -203,6 +231,32 @@ def tag(text: str, color: str) -> str:
     return f"{color}{c_bold()}[{text}]{c_reset()}"
 
 
+
+def format_route_label(info) -> str:
+    """Format a RouteInfo (ai_logic.core.routing) into a colored label string.
+
+    This keeps UI concerns in UI layer while allowing common.route_for()
+    to remain backward compatible.
+    """
+    try:
+        backend = getattr(info, 'backend', '') or ''
+        mode = getattr(info, 'mode', '') or ''
+        provider = str(getattr(info, 'provider', '') or '').strip()
+        model = str(getattr(info, 'model', '') or '').strip()
+    except Exception:
+        return str(info)
+
+    model_s = model or '(unset)'
+    if backend == 'api':
+        prov = (provider or 'api').upper()
+        core = f"{tag('API', c_yellow())} -> {tag(prov, c_green())} • {model_s}"
+    else:
+        core = f"{tag('LOCAL', c_green())} • {model_s}"
+    if mode == 'auto':
+        return f"{tag('AUTO', c_yellow())} -> {core}"
+    return core
+
+
 def hr(width: Optional[int] = None, char: str = "─") -> str:
     """
     Horizontal rule string. Unicode char is replaced with '-' if unicode unsupported.
@@ -267,12 +321,19 @@ def print_success(msg: str) -> None:
     _safe_write(wrap(f"{tag('OK', c_green())} {msg}", width=min(cols, 120)) + "\n")
 
 
+def print_error(msg: str) -> None:
+    """Print an error line to stderr (calm style)."""
+    if msg is None:
+        msg = ''
+    _safe_write_err(str(msg) + ('\n' if not str(msg).endswith('\n') else ''))
+
 def print_brief_error(msg: str) -> None:
     """
-    “Calm error” — short, actionable, no stacktrace.
-    Keep the original project convention: '(cek: ai status)'.
+    Calm error — short, actionable, no stacktrace.
+    Keeps original project convention: '(cek: ai status)'.
+    Printed to stderr.
     """
-    _safe_write(f"{tag('ERROR', c_red())} {msg} (cek: ai status)\n")
+    print_error(f"{tag('ERROR', c_red())} {msg} (cek: ai status)")
 
 
 def print_exception(prefix: str, ex: BaseException, hint: str = "") -> None:
@@ -394,7 +455,7 @@ class _SpinnerStyle:
 
 def _default_spinner_style() -> _SpinnerStyle:
     if supports_unicode():
-        return _SpinnerStyle(frames="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", ok_mark="✅")
+        return _SpinnerStyle(frames="⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏", ok_mark=_emoji('✅', 'OK'))
     return _SpinnerStyle(frames="|/-\\", ok_mark="OK")
 
 

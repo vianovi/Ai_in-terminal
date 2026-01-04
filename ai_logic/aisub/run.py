@@ -38,12 +38,20 @@ from ai_logic.ui import ansi
 
 # --- COMMON IMPORT PATH ---
 try:
-    # Disarankan: RUN_PROFILE_PATH mengarah ke file: workspace/run_profile.json
-    from ai_logic.common import RUN_PROFILE_PATH
-except ImportError:
+    # Disarankan: RUN_PROFILE_PATH mengarah ke file: ~/.config/ai-term/run_profile.json
+    from ai_logic.common import (
+        RUN_PROFILE_PATH,
+        DENY_SUBSTRINGS as COMMON_DENY_SUBSTRINGS,
+        RISKY_PATTERNS as COMMON_RISKY_PATTERNS,
+        run_shell_command,
+    )
+except Exception:
     # Fallback aman bila common belum tersedia / belum updated.
-    # Konsisten dengan blueprint: default file path.
     RUN_PROFILE_PATH = Path.cwd() / "workspace" / "run_profile.json"
+    COMMON_DENY_SUBSTRINGS = ["rm -rf /", "mkfs", "dd if=", "shutdown", "reboot", "poweroff"]
+    COMMON_RISKY_PATTERNS = [r"\brm\s+-rf\b", r"\bdd\s+if=", r"\bmkfs(\.\w+)?\b"]
+    def run_shell_command(cmd: str, *, cfg=None, check: bool=False, env=None):
+        return subprocess.run(cmd, shell=True, executable="/bin/sh", check=check, env=env)
 
 # --- SOFT DEPENDENCY: JSON5 ---
 # JSON5 memungkinkan komentar, trailing comma, dsb. Jika tidak ada, fallback JSON standar.
@@ -78,27 +86,10 @@ HISTORY_FILE = PROFILE_FILE.parent / "run_history.json"
 
 # Deny-list destruktif: blok total (hard-stop).
 # NOTE: Ini bukan sandbox; tetapi deny-list mencegah kasus-kasus paling berbahaya.
-DENY_SUBSTRINGS = [
-    "rm -rf /",
-    ":(){:|:&};:",
-    "mkfs",
-    "dd if=",
-    "> /dev/sda",
-    "mv /",
-    "shutdown",
-    "poweroff",
-    "reboot",
-]
+DENY_SUBSTRINGS = list(COMMON_DENY_SUBSTRINGS)
 
 # Pola berisiko: tidak diblok total, tapi WAJIB konfirmasi walau risk=low.
-RISKY_PATTERNS = [
-    r"\brm\s+-rf\b",                 # rm -rf di mana pun
-    r"\bdd\s+if=",                   # dd if=
-    r"\bmkfs(\.\w+)?\b",             # mkfs / mkfs.ext4
-    r">\s*/dev/sd[a-z]\b",           # redirect ke disk raw
-    r"\bparted\b|\bfdisk\b|\bgdisk\b",
-    r"\bsystemctl\s+(disable|mask)\b",
-]
+RISKY_PATTERNS = list(COMMON_RISKY_PATTERNS)
 _RISKY_REGEX = re.compile("|".join(f"(?:{p})" for p in RISKY_PATTERNS), re.IGNORECASE)
 
 # Multiline / control injection
@@ -730,7 +721,7 @@ def cmd_exec_run(profile: dict[str, Any], is_dry_run: bool) -> int:
         # G) Execute
         try:
             t0 = time.time()
-            exit_code = subprocess.call(final_cmd, shell=True, executable="/bin/bash")
+            exit_code = int(run_shell_command(final_cmd, cfg={}).returncode)
             dt = time.time() - t0
 
             if exit_code != 0:

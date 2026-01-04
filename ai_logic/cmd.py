@@ -5,7 +5,15 @@ import os
 import subprocess
 from shutil import which
 
-from ai_logic.common import mem_context_text, record_last_error, backend_mode, route_for
+from ai_logic.common import (
+    mem_context_text,
+    record_last_error,
+    backend_mode,
+    route_for,
+    DENY_SUBSTRINGS as COMMON_DENY_SUBSTRINGS,
+    evaluate_command,
+    run_shell_command,
+)
 from ai_logic.ui.ansi import (
     Spinner,
     flush_stdin,
@@ -28,15 +36,8 @@ from ai_logic.backends.local_ollama import chat as ollama_chat, ollama_host, loc
 from ai_logic.ui.prompts import local_tokens_for_cmd
 
 
-DENY_SUBSTRINGS = [
-    "rm -rf /",
-    " mkfs",
-    "dd if=",
-    ":(){:|:&};:",
-    " shutdown",
-    " reboot",
-    " poweroff",
-]
+# Centralized deny-list (compat alias; single source of truth in ai_logic.core.safety)
+DENY_SUBSTRINGS = list(COMMON_DENY_SUBSTRINGS)
 
 
 def _cmd_help() -> None:
@@ -126,7 +127,7 @@ def handle(argv: list[str], cfg: dict) -> int:
                 except Exception:
                     raw2 = repair_json_once(raw, "api")
                     purpose, cmd, risk = parse_obj(raw2)
-                return render_cmd_flow(cmd, risk, purpose)
+                return render_cmd_flow(cmd, risk, purpose, cfg)
             except KeyboardInterrupt:
                 record_last_error("cmd", "api", "KeyboardInterrupt saat menunggu API (cmd).")
                 flush_stdin()
@@ -152,7 +153,7 @@ def handle(argv: list[str], cfg: dict) -> int:
         except Exception:
             raw2 = repair_json_once(raw, "local")
             purpose, cmd, risk = parse_obj(raw2)
-        return render_cmd_flow(cmd, risk, purpose)
+        return render_cmd_flow(cmd, risk, purpose, cfg)
     except KeyboardInterrupt:
         record_last_error("cmd", "local", "KeyboardInterrupt saat menunggu LOCAL (cmd).")
         flush_stdin()
@@ -166,13 +167,7 @@ def handle(argv: list[str], cfg: dict) -> int:
 
 
 def is_denied(cmd: str) -> bool:
-    c = (cmd or "").strip()
-    if not c or "\n" in c or "\r" in c:
-        return True
-    for bad in DENY_SUBSTRINGS:
-        if bad in c:
-            return True
-    return False
+    return bool(evaluate_command(cmd).blocked)
 
 
 def confirm(prompt: str) -> bool:
@@ -180,8 +175,8 @@ def confirm(prompt: str) -> bool:
     return ans == "y"
 
 
-def run_command(cmd: str) -> int:
-    p = subprocess.run(cmd, shell=True)
+def run_command(cmd: str, cfg: dict | None = None) -> int:
+    p = run_shell_command(cmd, cfg=cfg or {})
     return int(p.returncode)
 
 
@@ -215,7 +210,7 @@ def copy_to_clipboard(text: str) -> bool:
     return False
 
 
-def render_cmd_flow(cmd: str, risk: str, purpose: str) -> int:
+def render_cmd_flow(cmd: str, risk: str, purpose: str, cfg: dict | None = None) -> int:
     cols, _ = term_size()
 
     if is_denied(cmd):
@@ -235,7 +230,7 @@ def render_cmd_flow(cmd: str, risk: str, purpose: str) -> int:
             return 0
 
     if confirm("⚠️  Jalankan command ini? [y/N]: "):
-        rc = run_command(cmd)
+        rc = run_command(cmd, cfg=cfg)
         print(f"{tag('DONE', c_green())} Selesai. Exit code: {rc}")
         return rc
 

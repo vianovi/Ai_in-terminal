@@ -1,186 +1,103 @@
+"""AI_IN-TERMINAL — ai_logic.common
+Version: 1.5 (2026-01-04)
+
+Changelog (1.5)
+- Centralized core concerns into ai_logic.core (paths/config/storage/memory/safety/routing/exec).
+- Added atomic JSON writes for config/memory/last_error.
+- Introduced data-first routing via RouteInfo + route_info().
+- Preserved legacy API surface (function names + constants) for backward compatibility.
+
+Compatibility
+- Existing imports from ai_logic.common should keep working.
+- route_for() remains available, but formatting is delegated to ai_logic.ui.ansi.
+"""
+
 from __future__ import annotations
 
-import datetime as _dt
 import json
-import os
 import re
-from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
+from ai_logic.core.paths import (
+    APP_DIR,
+    CONFIG_PATH,
+    MEMORY_PATH,
+    LAST_ERROR_PATH,
+    MON_HISTORY_PATH,
+    RUN_PROFILE_PATH,
+    LOGIC_PATH,
+    FISH_DIR,
+    FISH_FUNCS_DIR,
+)
+from ai_logic.core.config import load_config
+from ai_logic.core.last_error import record_last_error, read_last_error
+from ai_logic.core.memory import load_memory, save_memory, mem_context_text
+from ai_logic.core.routing import (
+    RouteInfo,
+    backend_mode,
+    api_provider,
+    api_active_model_raw,
+    route_info,
+)
+from ai_logic.core.safety import (
+    SafetyPolicy,
+    SafetyDecision,
+    DEFAULT_DENY_SUBSTRINGS,
+    DEFAULT_RISKY_PATTERNS,
+    default_policy,
+    extend_policy,
+    evaluate_command,
+    is_denied,
+    is_risky,
+)
+from ai_logic.core.exec import resolve_shell_executable, run_shell_command, run_argv
+
 
 # ============================================================
-# Path penting (single place)
+# API models supported (informational)
 # ============================================================
-
-APP_DIR = Path.home() / ".config" / "ai-term"
-CONFIG_PATH = APP_DIR / "config.json"
-MEMORY_PATH = APP_DIR / "memory.json"
-LAST_ERROR_PATH = APP_DIR / "last_error.json"
-MON_HISTORY_PATH = APP_DIR / "mon_history.json"
-RUN_PROFILE_PATH = APP_DIR / "run_profile.json"
-
-# Informational paths (untuk status)
-LOGIC_PATH = Path.home() / ".local" / "bin" / "ai-term"
-FISH_DIR = Path.home() / ".config" / "fish"
-FISH_FUNCS_DIR = FISH_DIR / "functions"
 
 SUPPORTED_API_MODELS = {
     "gemini": ["gemini-2.5-flash", "gemini-2.5-pro", "gemini-2.0-flash", "gemini-2.0-flash-lite"],
     "openai": ["gpt-4o-mini", "gpt-4.1-mini"],
 }
 
-DENY_SUBSTRINGS = [
-    "rm -rf /",
-    " mkfs",
-    "dd if=",
-    ":(){:|:&};:",
-    " shutdown",
-    " reboot",
-    " poweroff",
-]
+
+# ============================================================
+# Backward-compatible aliases (legacy names)
+# ============================================================
+
+# Legacy deny list name used by multiple modules.
+DENY_SUBSTRINGS = list(DEFAULT_DENY_SUBSTRINGS)
+
+# A few modules historically used these patterns; expose them centrally.
+RISKY_PATTERNS = list(DEFAULT_RISKY_PATTERNS)
 
 
 # ============================================================
-# Config / memory / last error
+# Routing legacy wrapper (kept for compatibility)
 # ============================================================
-
-def load_config() -> dict:
-    if not CONFIG_PATH.exists():
-        APP_DIR.mkdir(parents=True, exist_ok=True)
-        default = {
-            "backend_mode": "auto",  # "local" | "api" | "auto"
-            "ollama": {
-                "host": "http://localhost:11434",
-                "active_model_ask": "llama3.1:8b",
-                "active_model_cmd": "llama3.1:8b",
-            },
-            "api": {
-                "provider": "gemini",
-                "active_model": "gemini-2.5-flash",  # boleh juga "models/gemini-2.5-flash"
-                "openai_api_key_env": "OPENAI_API_KEY",
-                "gemini_api_key_env": "GEMINI_API_KEY",
-            },
-            "memory": {
-                "enabled": True,
-                "max_chars": 900,
-            },
-        }
-        CONFIG_PATH.write_text(json.dumps(default, indent=2), encoding="utf-8")
-    return json.loads(CONFIG_PATH.read_text(encoding="utf-8"))
-
-
-def record_last_error(stage: str, backend: str, detail: str) -> None:
-    try:
-        APP_DIR.mkdir(parents=True, exist_ok=True)
-        payload = {
-            "time": _dt.datetime.now().isoformat(timespec="seconds"),
-            "stage": stage,
-            "backend": backend,
-            "detail": (detail or "")[:6000],
-        }
-        LAST_ERROR_PATH.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-    except Exception:
-        pass
-
-
-def read_last_error() -> dict | None:
-    try:
-        if not LAST_ERROR_PATH.exists():
-            return None
-        d = json.loads(LAST_ERROR_PATH.read_text(encoding="utf-8"))
-        return d if isinstance(d, dict) else None
-    except Exception:
-        return None
-
-
-def load_memory(cfg: dict) -> dict:
-    if not cfg.get("memory", {}).get("enabled", True):
-        return {"enabled": False, "summary": ""}
-    if not MEMORY_PATH.exists():
-        return {"enabled": True, "summary": ""}
-    try:
-        d = json.loads(MEMORY_PATH.read_text(encoding="utf-8"))
-        if not isinstance(d, dict):
-            return {"enabled": True, "summary": ""}
-        d.setdefault("enabled", True)
-        d.setdefault("summary", "")
-        return d
-    except Exception:
-        return {"enabled": True, "summary": ""}
-
-
-def save_memory(summary: str, cfg: dict) -> None:
-    if not cfg.get("memory", {}).get("enabled", True):
-        return
-    max_chars = int(cfg.get("memory", {}).get("max_chars", 900))
-    summary = (summary or "").strip()[:max_chars]
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    MEMORY_PATH.write_text(json.dumps({"enabled": True, "summary": summary}, indent=2), encoding="utf-8")
-
-
-def mem_context_text(cfg: dict) -> str:
-    mem = load_memory(cfg)
-    if not mem.get("enabled", True):
-        return ""
-    s = str(mem.get("summary") or "").strip()
-    return f"Konteks singkat terakhir (agar aku nyambung): {s}" if s else ""
-
-
-# ============================================================
-# Backend routing (konsisten dan terpusat)
-# ============================================================
-
-def backend_mode(cfg: dict) -> str:
-    return (cfg.get("backend_mode") or "local").strip().lower()
-
-
-def api_provider(cfg: dict) -> str:
-    return (cfg.get("api", {}).get("provider") or "gemini").strip().lower()
-
-
-def api_active_model_raw(cfg: dict) -> str:
-    return str(cfg.get("api", {}).get("active_model") or "").strip()
-
 
 def route_for(cfg: dict, want: str) -> tuple[str, str]:
-    """
-    Return: (backend, route_label)
-      backend: "local" | "api"
+    """Legacy wrapper returning (backend, route_label).
+
+    Notes
+    - Backend selection is data-first via route_info().
+    - UI formatting is delegated to ai_logic.ui.ansi.
+
     want: "ask" | "cmd"
     """
-    from ai_logic.ui.ansi import tag, c_yellow, c_green, c_dim, c_reset
+    info = route_info(cfg, want)
 
-    mode = backend_mode(cfg)
+    # UI formatting is intentionally imported lazily to avoid hard coupling.
+    from ai_logic.ui.ansi import format_route_label
 
-    def api_label() -> str:
-        prov = (api_provider(cfg) or "api").strip().upper()
-        raw_model = api_active_model_raw(cfg) or "(unset)"
-        return f"{tag('API', c_yellow())} -> {tag(prov, c_green())} • {raw_model}"
-
-    def local_label() -> str:
-        from ai_logic.backends.local_ollama import local_model_for
-        return f"{tag('LOCAL', c_green())} • {local_model_for(cfg, want) or '(unset)'}"
-
-    if mode == "local":
-        return "local", local_label()
-
-    if mode == "auto":
-        try:
-            from ai_logic.backends.api_gemini import validate_api_config
-            ok, _note, _detail = validate_api_config(cfg)
-        except Exception:
-            ok = False
-        if ok:
-            return "api", f"{tag('AUTO', c_yellow())} -> {api_label()}"
-        return "local", f"{tag('AUTO', c_yellow())} -> {local_label()}"
-
-    # mode == "api"
-    return "api", api_label()
+    return info.backend, format_route_label(info)
 
 
 # ============================================================
-# HTTP JSON helper (dipakai oleh backend wrappers)
+# HTTP JSON helper (used by backend wrappers)
 # ============================================================
 
 def http_json(method: str, url: str, payload: dict | None = None, timeout: int = 60, headers: dict | None = None) -> dict:
