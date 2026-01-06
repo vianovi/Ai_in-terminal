@@ -1,30 +1,34 @@
 """
-AI-Term • MON (System Cockpit & Intelligence) — V3
+AI-Term • MON (System Cockpit & Intelligence) — V4.0
 
 Tujuan:
-- `ai mon live`    : HUD realtime yang enak dipandang + informatif (tanpa noise seperti per-core temp).
+- `ai mon live`    : HUD realtime yang clean, vertikal, dan informatif.
 - `ai mon sensors` : tampilkan SEMUA sensor/field yang bisa dibaca (psutil + sysfs + optional tools).
 - `ai mon batt`    : laporan battery intel + history tracking.
 - `ai mon disk`    : laporan storage SMART/TBW + history tracking (tanpa memaksa sudo).
 - `ai mon net`     : network diagnostics (ping/dns + wifi detail).
 - `ai mon net live`: live ping graph.
 
-V3 Update (baru):
-- SWAP usage ditampilkan di HUD.
-- Disk I/O ala Windows Task Manager:
-  - Active time (%) + read/write speed real-time dari /sys/block/<dev>/stat (tanpa sudo).
-- GPU usage (opsional):
-  - Prefer sysfs: /sys/class/drm/card*/device/gpu_busy_percent (Intel/AMD biasanya ada).
-  - Fallback NVIDIA: `nvidia-smi` jika tersedia.
-- Ping quality & jitter (opsional) ditampilkan di HUD (sampler background).
-- Footer: info kernel + nama hardware penting (CPU/GPU/NVMe) + caching agar tidak berat.
+V4.0 Update (baru):
+- Header lebih berisi: host, mode LIVE, interval, target ping, iface.
+- Intel iGPU-first monitoring:
+  - Prefer sysfs: /sys/class/drm/card*/device/gpu_busy_percent (vendor 0x8086).
+  - Optional freq: gt_cur_freq_mhz / gt_max_freq_mhz (best-effort).
+- DISKS dipindah ke section tersendiri (di bawah, sebelum hardware footer):
+  - Menampilkan partisi yang *sedang ter-mount* saja (mirip KDE System Monitor).
+  - Jika user mount partisi lain (mis. Windows), otomatis ikut tampil (tanpa scan paksa semua disk).
+  - Ada bar, persen, used/total, dan Free space.
+- Network quality label (FAST/OK/SLOW) berbasis ping average + jitter + WiFi signal.
+- CPU: tampilkan TopCPU process (opsional, throttled agar ringan).
+- Thermal throttling indicator (best-effort via sysfs thermal_throttle counters).
+- Shell safety: internal subprocess calls tidak pakai shell=True (anti-injection, lebih portable).
 
 Catatan desain:
 - Dependency utama: `psutil` (Wajib untuk monitoring).
   Install Fedora: sudo dnf install python3-psutil
 - Optional tools:
-  sudo dnf install lm_sensors smartmontools pciutils iw iproute
-  (optional GPU NVIDIA): nvidia-smi (paket driver NVIDIA)
+  sudo dnf install lm_sensors smartmontools pciutils iw iproute util-linux
+  (optional iGPU advanced): sudo dnf install intel-gpu-tools
 - History path: ai_logic.common.MON_HISTORY_PATH (fallback aman bila common belum update).
 - Tidak memakai rich (ANSI-only, konsisten dengan project).
 - Tidak memunculkan ERROR yang bikin panik untuk kondisi wajar (mis. sensor tidak tersedia).
@@ -32,7 +36,7 @@ Catatan desain:
   Untuk data lengkap: jalankan `sudo ai mon disk`.
 
 Subcommands:
-  ai mon live [--interval N] [--compact] [--target HOST] [--iface IFACE]
+  ai mon live [--interval N] [--compact] [--target HOST] [--iface IFACE] [--disk "LABEL=TARGET"] [--no-disks] [--maxwidth N]
   ai mon sensors
   ai mon batt
   ai mon disk [--sudo|--deep]
@@ -54,6 +58,8 @@ import socket
 import datetime as _dt
 import subprocess
 import threading
+import shlex
+import textwrap
 from collections import deque
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, List
@@ -82,27 +88,36 @@ except Exception:
 def _now_ts() -> str:
     return _dt.datetime.now().strftime("%A | %H:%M:%S")
 
-def _sh(cmd: str, timeout: int = 10) -> tuple[int, str]:
-    """
-    Shell helper:
-    - return (exit_code, stdout_text)
-    - stderr suppressed (untuk UI yang tidak berisik)
-    """
+def _run(argv: list[str], timeout: int = 10) -> tuple[int, str]:
+    """Run subprocess safely (shell=False). Return (code, stdout)."""
     try:
         p = subprocess.run(
-            cmd,
-            shell=True,
-            executable="/bin/bash",
+            argv,
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             text=True,
             timeout=timeout,
+            check=False,
         )
         return int(p.returncode), (p.stdout or "").strip()
     except subprocess.TimeoutExpired:
         return 124, ""
     except Exception:
         return 1, ""
+
+def _cmd(cmd: str, timeout: int = 10) -> tuple[int, str]:
+    """Compat helper: shlex-split string command then run safely (no pipes/redirection)."""
+    try:
+        argv = shlex.split(cmd)
+    except Exception:
+        return 1, ""
+    if not argv:
+        return 1, ""
+    return _run(argv, timeout=timeout)
+
+def _sh(cmd: str, timeout: int = 10) -> tuple[int, str]:
+    """Legacy alias (V3) — now safe (no shell). Pipes/redirect are NOT supported."""
+    return _cmd(cmd, timeout=timeout)
 
 def _read_text(p: Path) -> str:
     try:
@@ -837,7 +852,7 @@ def _pick_root_disk_dev() -> Optional[str]:
     # try find root source
     src = ""
     try:
-        code, out = _sh("findmnt -n -o SOURCE /", timeout=2)
+        code, out = _run(['findmnt','-n','-o','SOURCE','/'], timeout=2)
         if code == 0 and out:
             src = out.strip()
     except Exception:
@@ -846,7 +861,7 @@ def _pick_root_disk_dev() -> Optional[str]:
     if src.startswith("/dev/"):
         base = os.path.basename(src)
         # if partition like nvme0n1p2 -> parent disk nvme0n1
-        code, out = _sh(f"lsblk -no PKNAME /dev/{base} 2>/dev/null", timeout=2)
+        code, out = _run(['lsblk','-no','PKNAME', f'/dev/{base}'], timeout=2)
         if code == 0 and out.strip():
             return out.strip()
         # maybe already disk
@@ -858,83 +873,97 @@ def _pick_root_disk_dev() -> Optional[str]:
         return "nvme0n1"
 
     # fallback: first disk from lsblk
-    code, out = _sh("lsblk -d -n -o NAME,TYPE | awk '$2==\"disk\"{print $1}' | head -n 1", timeout=2)
-    if code == 0 and out.strip():
-        return out.strip()
+    if shutil.which('lsblk'):
+        code, out = _run(['lsblk','-d','-n','-o','NAME,TYPE'], timeout=2)
+        if code == 0 and out:
+            for ln in out.splitlines():
+                parts = ln.split()
+                if len(parts) >= 2 and parts[1] == 'disk':
+                    return parts[0].strip()
+
 
     return None
 
 
 # ==========================================================
-# 5) GPU READER (sysfs preferred, nvidia-smi fallback)
+# 5) GPU READER (Intel iGPU-first)
 # ==========================================================
 
 class GPUReader:
-    """
-    GPU usage (opsional) dengan beberapa backend:
-    1) sysfs: /sys/class/drm/card*/device/gpu_busy_percent
-       - sering tersedia pada Intel/AMD.
-    2) nvidia-smi: query utilization.gpu (NVIDIA).
+    """Intel iGPU-first GPU usage.
+
+    Prefer sysfs (i915/DRM): /sys/class/drm/card*/device/gpu_busy_percent
+    Notes:
+    - Only monitors Intel vendor 0x8086 by default.
+    - If sensor is missing, returns ok=False (no noisy fallback to NVIDIA/AMD).
     """
 
+    INTEL_VENDOR = "0x8086"
+
     @staticmethod
-    def _sysfs_gpu_busy_candidates() -> List[Path]:
+    def _intel_cards() -> list[Path]:
         root = Path("/sys/class/drm")
         if not root.exists():
             return []
-        cand: List[Path] = []
+        cards: list[Path] = []
         for c in sorted(root.glob("card[0-9]*")):
-            p = c / "device" / "gpu_busy_percent"
-            if p.exists():
-                cand.append(p)
-        return cand
+            dev = c / "device"
+            if not dev.exists():
+                continue
+            vendor = _read_text(dev / "vendor")
+            if vendor.strip().lower() == GPUReader.INTEL_VENDOR:
+                cards.append(c)
+        return cards
 
     @staticmethod
-    def _read_sysfs_busy() -> Optional[float]:
-        for p in GPUReader._sysfs_gpu_busy_candidates():
-            v = _read_float(p)
-            if isinstance(v, (int, float)):
-                # choose first valid (usually card0)
-                return float(v)
-        return None
-
-    @staticmethod
-    def _read_nvidia_smi_busy() -> Optional[float]:
-        if not shutil.which("nvidia-smi"):
-            return None
-        # query utilization.gpu without headers
-        code, out = _sh("nvidia-smi --query-gpu=utilization.gpu --format=csv,noheader,nounits | head -n 1", timeout=2)
-        if code != 0 or not out:
-            return None
-        try:
-            return float(out.strip())
-        except Exception:
-            return None
+    def _read_freq_mhz(dev: Path) -> tuple[Optional[int], Optional[int]]:
+        # best-effort across kernel variants
+        cand_cur = [dev / "gt_cur_freq_mhz", dev / "device" / "gt_cur_freq_mhz"]
+        cand_max = [dev / "gt_max_freq_mhz", dev / "device" / "gt_max_freq_mhz"]
+        cur = None
+        mx = None
+        for p in cand_cur:
+            v = _read_int(p)
+            if isinstance(v, int):
+                cur = v
+                break
+        for p in cand_max:
+            v = _read_int(p)
+            if isinstance(v, int):
+                mx = v
+                break
+        return cur, mx
 
     @staticmethod
     def read_usage_pct() -> dict[str, Any]:
-        """
-        Return:
-          { ok, pct, backend }
-        """
-        v = GPUReader._read_sysfs_busy()
-        if v is not None:
-            return {"ok": True, "pct": float(v), "backend": "sysfs(gpu_busy_percent)"}
-
-        v2 = GPUReader._read_nvidia_smi_busy()
-        if v2 is not None:
-            return {"ok": True, "pct": float(v2), "backend": "nvidia-smi"}
-
-        return {"ok": False, "pct": None, "backend": "none"}
+        for card in GPUReader._intel_cards():
+            dev = card / "device"
+            busy = dev / "gpu_busy_percent"
+            if busy.exists():
+                v = _read_float(busy)
+                if isinstance(v, (int, float)):
+                    cur, mx = GPUReader._read_freq_mhz(dev)
+                    return {
+                        "ok": True,
+                        "pct": float(v),
+                        "backend": "sysfs(intel gpu_busy_percent)",
+                        "card": card.name,
+                        "freq_cur_mhz": cur,
+                        "freq_max_mhz": mx,
+                    }
+        return {"ok": False, "pct": None, "backend": "intel-sysfs-missing"}
 
     @staticmethod
     def gpu_name_hint() -> str:
-        if not shutil.which("lspci"):
-            return ""
-        code, out = _sh("lspci | grep -iE 'vga|3d|display' | head -n 1", timeout=3)
-        if code != 0 or not out:
-            return ""
-        return out.split(": ", 1)[-1].strip()
+        # Prefer lspci if available, but parse without pipes.
+        if shutil.which("lspci"):
+            code, out = _run(["lspci"], timeout=3)
+            if code == 0 and out:
+                for ln in out.splitlines():
+                    low = ln.lower()
+                    if ("vga" in low) or ("3d controller" in low) or ("display" in low):
+                        return ln.split(": ", 1)[-1].strip()
+        return ""
 
 
 # ==========================================================
@@ -960,6 +989,11 @@ class PingSampler:
 
     def stop(self) -> None:
         self._stop.set()
+
+    def avg(self) -> Optional[float]:
+        if not self.window:
+            return None
+        return sum(self.window) / float(len(self.window))
 
     def jitter(self) -> Optional[float]:
         if len(self.window) < 3:
@@ -1171,8 +1205,9 @@ def run_battery_check() -> int:
 
 
 def _lsblk_disks() -> list[dict[str, str]]:
-    cmd = "lsblk -J -d -o NAME,MODEL,SIZE,TYPE,TRAN,ROTA"
-    code, out = _sh(cmd, timeout=3)
+    if not shutil.which('lsblk'):
+        return []
+    code, out = _run(['lsblk','-J','-d','-o','NAME,MODEL,SIZE,TYPE,TRAN,ROTA'], timeout=3)
     if code != 0 or not out:
         return []
     try:
@@ -1503,7 +1538,182 @@ def run_net_live(argv: list[str]) -> int:
 
 
 # ==========================================================
-# 8) LIVE COCKPIT (HUD V3)
+# 8) LIVE COCKPIT (HUD V4.0)
+# ==========================================================
+
+_IGNORED_FS_TYPES = {
+    "proc", "sysfs", "devtmpfs", "devpts", "tmpfs", "cgroup", "cgroup2", "pstore",
+    "securityfs", "debugfs", "tracefs", "configfs", "efivarfs", "mqueue", "hugetlbfs",
+    "fusectl", "autofs", "overlay", "squashfs",
+}
+
+def _mounted_partitions() -> list[dict[str, str]]:
+    """Return mounted partitions (non-virtual) — mirrors KDE System Monitor behavior."""
+    if psutil is None:
+        return []
+    items: list[dict[str, str]] = []
+    try:
+        parts = psutil.disk_partitions(all=False)
+    except Exception:
+        return []
+
+    for p in parts:
+        mp = (getattr(p, "mountpoint", "") or "").strip()
+        dev = (getattr(p, "device", "") or "").strip()
+        fstype = (getattr(p, "fstype", "") or "").strip().lower()
+
+        if not mp or not dev:
+            continue
+        if fstype in _IGNORED_FS_TYPES:
+            continue
+        # Skip pseudo mounts by mountpoint
+        if mp.startswith(("/proc", "/sys", "/dev")):
+            continue
+        # /run/media is a legit user-mount location (e.g., dual-boot partitions opened via Dolphin)
+        if mp.startswith("/run") and not mp.startswith("/run/media"):
+            continue
+        # Skip loop devices etc
+        bdev = os.path.basename(dev)
+        if bdev.startswith(("loop", "zram", "ram", "sr")):
+            continue
+
+        items.append({"mount": mp, "device": dev, "fstype": fstype})
+
+    # prefer stable ordering: root, home, then others
+    def _key(x: dict[str, str]) -> tuple[int, str]:
+        mp = x.get("mount", "")
+        if mp == "/":
+            return (0, mp)
+        if mp == "/home":
+            return (1, mp)
+        return (2, mp)
+
+    return sorted(items, key=_key)
+
+
+def _default_disk_label(mountpoint: str, device: str) -> str:
+    if mountpoint == "/":
+        return "root"
+    if mountpoint == "/home":
+        return "home"
+    base = os.path.basename(mountpoint.rstrip("/"))
+    if base:
+        return base
+    return os.path.basename(device) or "disk"
+
+
+def _parse_disk_specs(argv: list[str]) -> tuple[list[tuple[str, str]], list[str]]:
+    """Parse --disk "LABEL=TARGET" (repeatable). Return (specs, remaining_argv)."""
+    specs: list[tuple[str, str]] = []
+    rest: list[str] = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--disk" and i + 1 < len(argv):
+            raw = (argv[i + 1] or "").strip()
+            i += 2
+            if "=" in raw:
+                label, target = raw.split("=", 1)
+                label = label.strip() or "disk"
+                target = target.strip()
+                if target:
+                    specs.append((label, target))
+            continue
+        rest.append(a)
+        i += 1
+    return specs, rest
+
+
+def _resolve_disk_target(target: str, mounts: list[dict[str, str]]) -> Optional[str]:
+    """Resolve TARGET to mountpoint (supports mountpoint or device path/name)."""
+    t = target.strip()
+    if not t:
+        return None
+    # direct mountpoint
+    for m in mounts:
+        if m["mount"] == t:
+            return m["mount"]
+    # device path match
+    for m in mounts:
+        if m["device"] == t:
+            return m["mount"]
+    # bare device name match
+    for m in mounts:
+        if os.path.basename(m["device"]) == t:
+            return m["mount"]
+    return None
+
+
+def _net_quality(ping_avg_ms: Optional[float], jitter_ms: Optional[float], wifi_dbm: Optional[float]) -> tuple[str, str]:
+    """Return (label, color)."""
+    score = 0
+    if isinstance(ping_avg_ms, (int, float)):
+        if ping_avg_ms <= 40:
+            score += 2
+        elif ping_avg_ms <= 120:
+            score += 1
+    if isinstance(jitter_ms, (int, float)):
+        if jitter_ms <= 15:
+            score += 2
+        elif jitter_ms <= 40:
+            score += 1
+    # wifi signal only if available; wired is treated as neutral
+    if isinstance(wifi_dbm, (int, float)):
+        if wifi_dbm >= -60:
+            score += 2
+        elif wifi_dbm >= -70:
+            score += 1
+    else:
+        score += 1
+
+    if score >= 5:
+        return "FAST", ansi.c_green()
+    if score >= 3:
+        return "OK", ansi.c_yellow()
+    return "SLOW", ansi.c_red()
+
+
+class ThrottleReader:
+    """Best-effort thermal throttling indicator (Intel-friendly)."""
+
+    def __init__(self) -> None:
+        self.prev_core: Optional[int] = None
+        self.prev_pkg: Optional[int] = None
+
+    def read(self) -> dict[str, Any]:
+        base = Path("/sys/devices/system/cpu/cpu0/thermal_throttle")
+        core_p = base / "core_throttle_count"
+        pkg_p = base / "package_throttle_count"
+        if not core_p.exists() and not pkg_p.exists():
+            return {"ok": False}
+        core = _read_int(core_p) if core_p.exists() else None
+        pkg = _read_int(pkg_p) if pkg_p.exists() else None
+
+        delta_core = None
+        delta_pkg = None
+        if isinstance(core, int) and isinstance(self.prev_core, int):
+            delta_core = core - self.prev_core
+        if isinstance(pkg, int) and isinstance(self.prev_pkg, int):
+            delta_pkg = pkg - self.prev_pkg
+
+        self.prev_core = core if isinstance(core, int) else self.prev_core
+        self.prev_pkg = pkg if isinstance(pkg, int) else self.prev_pkg
+
+        active = False
+        if isinstance(delta_core, int) and delta_core > 0:
+            active = True
+        if isinstance(delta_pkg, int) and delta_pkg > 0:
+            active = True
+
+        return {
+            "ok": True,
+            "core": core,
+            "pkg": pkg,
+            "delta_core": delta_core,
+            "delta_pkg": delta_pkg,
+            "active": active,
+        }
+
 # ==========================================================
 
 def _disk_usage_root() -> dict[str, Any]:
@@ -1545,15 +1755,28 @@ def _loadavg_str() -> str:
         return "-"
 
 def _cpu_model() -> str:
-    # cached by caller
-    code, out = _sh("cat /proc/cpuinfo | grep -m1 'model name' | cut -d: -f2-", timeout=2)
-    return out.strip() if code == 0 and out else ""
+    try:
+        txt = _read_text(Path('/proc/cpuinfo'))
+        for ln in txt.splitlines():
+            if ln.lower().startswith('model name'): 
+                return ln.split(':', 1)[-1].strip()
+    except Exception:
+        pass
+    return ''
 
 def _nvme_model_hint(dev: Optional[str]) -> str:
     if not dev:
-        return ""
-    code, out = _sh(f"lsblk -d -n -o MODEL /dev/{dev} 2>/dev/null | head -n 1", timeout=2)
-    return out.strip() if code == 0 and out else ""
+        return ''
+    # Prefer sysfs model if available
+    sys_p = Path(f'/sys/block/{dev}/device/model')
+    if sys_p.exists():
+        return _read_text(sys_p)
+    # Fallback lsblk without pipes
+    if shutil.which('lsblk'):
+        code, out = _run(['lsblk','-d','-n','-o','MODEL', f'/dev/{dev}'], timeout=2)
+        if code == 0 and out:
+            return out.splitlines()[0].strip()
+    return ''
 
 def _topmem_process() -> str:
     if psutil is None:
@@ -1571,42 +1794,83 @@ def _topmem_process() -> str:
     except Exception:
         return "-"
 
+def _topcpu_process(total_cpu_pct: float) -> str:
+    """Return top CPU process string. Throttled by caller."""
+    if psutil is None:
+        return "-"
+    try:
+        best_pct = 0.0
+        best_name = "?"
+        for p in psutil.process_iter(attrs=["name"]):
+            try:
+                pct = float(p.cpu_percent(interval=None) or 0.0)
+            except Exception:
+                continue
+            if pct > best_pct:
+                best_pct = pct
+                best_name = (p.info.get("name") or "?")
+        if best_pct <= 0.0:
+            return "-"
+        share = 0.0
+        if total_cpu_pct > 0.1:
+            share = (best_pct / total_cpu_pct) * 100.0
+        share = _clamp(share, 0.0, 100.0)
+        return f"{best_name} {best_pct:.1f}% ({share:.0f}% of CPU)"
+    except Exception:
+        return "-"
+
+
 def run_live_cockpit(argv: list[str]) -> int:
-    """
-    HUD realtime.
+    """HUD realtime (V4.0).
 
     Options:
-      --interval N   (float)
-      --compact
-      --target HOST  (ping sampler target, default google.com)
-      --iface IFACE  (net speedometer per NIC)
+      --interval N           (float)
+      --compact             (hide footer/tips)
+      --target HOST         (ping sampler target)
+      --iface IFACE         (net speedometer per NIC)
+      --disk "LABEL=TARGET" (repeatable; TARGET mountpoint or device)
+      --no-disks            (hide disks section)
+      --maxwidth N          (limit render width)
     """
     if psutil is None:
         ansi.print_brief_error("Fitur Monitoring butuh library 'psutil'.")
         print("Install Fedora: sudo dnf install python3-psutil")
         return 1
 
+    # parse custom disk specs first
+    disk_specs, argv2 = _parse_disk_specs(argv)
+
     interval = 1.0
     compact = False
     target = "google.com"
     iface: Optional[str] = None
+    show_disks = True
+    maxwidth: Optional[int] = None
 
     i = 0
-    while i < len(argv):
-        a = argv[i]
+    while i < len(argv2):
+        a = argv2[i]
         if a in ("--compact", "compact"):
             compact = True
-        elif a == "--interval" and i + 1 < len(argv):
+        elif a == "--no-disks":
+            show_disks = False
+        elif a == "--interval" and i + 1 < len(argv2):
             try:
-                interval = float(argv[i + 1])
+                interval = float(argv2[i + 1])
             except Exception:
                 pass
             i += 1
-        elif a == "--target" and i + 1 < len(argv):
-            target = argv[i + 1].strip() or target
+        elif a == "--target" and i + 1 < len(argv2):
+            target = argv2[i + 1].strip() or target
             i += 1
-        elif a == "--iface" and i + 1 < len(argv):
-            iface = argv[i + 1].strip() or None
+        elif a == "--iface" and i + 1 < len(argv2):
+            iface = argv2[i + 1].strip() or None
+            i += 1
+        elif a == "--maxwidth" and i + 1 < len(argv2):
+            try:
+                maxwidth = int(float(argv2[i + 1]))
+            except Exception:
+                maxwidth = None
             i += 1
         else:
             # numeric shortcut: ai mon live 0.5
@@ -1630,6 +1894,8 @@ def run_live_cockpit(argv: list[str]) -> int:
     ping = PingSampler(target=target, interval=max(2.0, interval * 2.0))
     ping.start()
 
+    thr = ThrottleReader()
+
     # caches/throttles
     last_snap = 0.0
     SNAP_EVERY = 600.0
@@ -1641,24 +1907,42 @@ def run_live_cockpit(argv: list[str]) -> int:
     hw_nvme = ""
     distro = _distro_pretty()
     kernel = _uname_kernel()
+    host = socket.gethostname()
 
     last_top = 0.0
     TOP_EVERY = 5.0
     topmem = "-"
+    topcpu = "-"
+
+    last_disks = 0.0
+    DISK_EVERY = 10.0
+    disk_cache: list[dict[str, Any]] = []
 
     input_muter = ansi.MuteInputDuringWait()
     ansi.alt_screen_enter()
     ansi.cursor_hide()
 
     try:
+        # prime cpu_percent and process cpu_percent
         try:
             psutil.cpu_percent(interval=None)
+        except Exception:
+            pass
+        try:
+            for p in psutil.process_iter():
+                try:
+                    p.cpu_percent(interval=None)
+                except Exception:
+                    continue
         except Exception:
             pass
 
         with input_muter:
             while True:
                 cols, _rows = ansi.term_size()
+                usable = min(cols, 96)
+                if isinstance(maxwidth, int) and maxwidth > 40:
+                    usable = min(usable, int(maxwidth))
 
                 # core metrics
                 try:
@@ -1675,25 +1959,55 @@ def run_live_cockpit(argv: list[str]) -> int:
                     ram_pct, ram_used, ram_total = 0.0, 0.0, 0.0
 
                 sw = SwapReader.read()
-
                 temps = ThermalReader.read_key_temps()
                 fan = ThermalReader.read_fan_rpm()
                 power = pr.read()
-                du = _disk_usage_root()
                 wifi = WiFiReader.read()
 
                 ns.update()
-
                 if disk_io:
                     disk_io.update()
 
-                # gpu usage
                 gpu = GPUReader.read_usage_pct()
 
-                # throttled topmem
+                # throttled top processes
                 if time.time() - last_top >= TOP_EVERY:
                     topmem = _topmem_process()
+                    topcpu = _topcpu_process(cpu)
                     last_top = time.time()
+
+                # throttled disks inventory (mounted-only)
+                if show_disks and (time.time() - last_disks >= DISK_EVERY):
+                    mounts = _mounted_partitions()
+                    disk_cache = []
+
+                    # apply user specs (label overrides)
+                    overrides: dict[str, str] = {}
+                    for label, target_spec in disk_specs:
+                        mp = _resolve_disk_target(target_spec, mounts)
+                        if mp:
+                            overrides[mp] = label
+
+                    for m in mounts:
+                        mp = m["mount"]
+                        dev = m["device"]
+                        label = overrides.get(mp) or _default_disk_label(mp, dev)
+                        try:
+                            du = shutil.disk_usage(mp)
+                            used_pct = (du.used / du.total) * 100.0 if du.total else 0.0
+                            disk_cache.append({
+                                "label": label,
+                                "mount": mp,
+                                "device": dev,
+                                "used": du.used,
+                                "total": du.total,
+                                "free": du.free,
+                                "pct": used_pct,
+                            })
+                        except Exception:
+                            continue
+
+                    last_disks = time.time()
 
                 # throttled hardware footer
                 if time.time() - last_hw >= HW_EVERY:
@@ -1750,21 +2064,25 @@ def run_live_cockpit(argv: list[str]) -> int:
                 # render
                 ansi.clear_screen()
 
-                title_left = f"{ansi.c_cyan()}{ansi.c_bold()} SYSTEM COCKPIT {ansi.c_reset()}"
+                title_left = f"{ansi.c_cyan()}{ansi.c_bold()} AI MONITOR {ansi.c_reset()}"                              f"{ansi.c_dim()}• LIVE SYSTEM COCKPIT{ansi.c_reset()}"
                 title_right = f"{ansi.c_dim()}AI-Terminal{ansi.c_reset()}"
-                usable = min(cols, 110)
-                gap = max(1, usable - (len(" SYSTEM COCKPIT ") + len("AI-Terminal") + 6))
+                gap = max(1, usable - (len(' AI MONITOR ')+len('• LIVE SYSTEM COCKPIT')+len('AI-Terminal')+10))
                 print(f"{title_left}{' ' * gap}{title_right}")
 
                 ts = _now_ts()
-                print(f"{ansi.c_dim()}{ts.center(min(cols, 80))}{ansi.c_reset()}")
-                print(f"{ansi.c_dim()}Uptime:{ansi.c_reset()} {_uptime_str()}   {ansi.c_dim()}Load:{ansi.c_reset()} {_loadavg_str()}   {ansi.c_dim()}Kernel:{ansi.c_reset()} {kernel}")
-                if distro and not compact:
-                    print(f"{ansi.c_dim()}OS:{ansi.c_reset()} {distro}")
-                print("-" * min(cols, 90))
+                meta = f"Host: {host}   Interval: {interval:.1f}s   Target: {target}"
+                if iface:
+                    meta += f"   Iface: {iface}"
+                print(f"{ansi.c_dim()}{ts}{ansi.c_reset()}  {ansi.c_dim()}|{ansi.c_reset()}  {meta}")
 
-                # CPU/RAM/SWAP/GPU bars
-                print(f"{ansi.c_bold()} CPU {ansi.c_reset()} {_draw_bar(cpu)} {cpu:>5.1f}%")
+                line_os = f"OS: {distro or '-'}   Kernel: {kernel}"
+                line_sys = f"Uptime: {_uptime_str()}   Load: {_loadavg_str()}"
+                print(f"{ansi.c_dim()}{line_os}{ansi.c_reset()}")
+                print(f"{ansi.c_dim()}{line_sys}{ansi.c_reset()}")
+                print("-" * min(usable, 96))
+
+                # CPU / RAM / SWAP / GPU
+                print(f"{ansi.c_bold()} CPU {ansi.c_reset()} {_draw_bar(cpu)} {cpu:>5.1f}%   {ansi.c_dim()}TopCPU:{ansi.c_reset()} {topcpu}")
                 print(f"{ansi.c_bold()} RAM {ansi.c_reset()} {_draw_bar(ram_pct)} {ram_pct:>5.1f}%   {ram_used/(1024**3):.1f}/{ram_total/(1024**3):.1f} GB   {ansi.c_dim()}TopMem:{ansi.c_reset()} {topmem}")
 
                 if sw.get("ok") and sw.get("total", 0) > 0:
@@ -1777,14 +2095,14 @@ def run_live_cockpit(argv: list[str]) -> int:
 
                 if gpu.get("ok") and isinstance(gpu.get("pct"), (int, float)):
                     gp = float(gpu["pct"])
-                    print(f"{ansi.c_bold()} GPU {ansi.c_reset()} {_draw_bar(gp)} {gp:>5.1f}%   {ansi.c_dim()}({gpu.get('backend')}){ansi.c_reset()}")
+                    freq = ""
+                    if isinstance(gpu.get("freq_cur_mhz"), int) and isinstance(gpu.get("freq_max_mhz"), int):
+                        freq = f"   {ansi.c_dim()}Freq:{ansi.c_reset()} {gpu['freq_cur_mhz']}/{gpu['freq_max_mhz']} MHz"
+                    print(f"{ansi.c_bold()} GPU {ansi.c_reset()} {_draw_bar(gp)} {gp:>5.1f}%   {ansi.c_dim()}Intel iGPU{ansi.c_reset()}{freq}")
                 else:
-                    print(f"{ansi.c_bold()} GPU {ansi.c_reset()} {ansi.c_dim()}(no gpu usage sensor){ansi.c_reset()}")
+                    print(f"{ansi.c_bold()} GPU {ansi.c_reset()} {ansi.c_dim()}(intel iGPU usage sensor N/A){ansi.c_reset()}")
 
-                # Disk usage / active time / rw speed
-                if du.get("ok"):
-                    dp = float(du.get("used_pct", 0.0))
-                    print(f"{ansi.c_bold()} DISK{ansi.c_reset()} {_draw_bar(dp)} {dp:>5.1f}%   /   {_human_bytes(float(du['used']))}/{_human_bytes(float(du['total']))}")
+                # I/O (active time + rw speed) — optional, root disk only
                 if disk_io and disk_dev:
                     util = float(disk_io.active_pct)
                     col_u = ansi.c_green() if util <= 60 else (ansi.c_yellow() if util <= 85 else ansi.c_red())
@@ -1792,9 +2110,9 @@ def run_live_cockpit(argv: list[str]) -> int:
                     w = _human_rate_bps(disk_io.write_bps)
                     print(f"{ansi.c_bold()} I/O {ansi.c_reset()} {col_u}{util:>5.1f}%{ansi.c_reset()}  R:{r:<10}  W:{w:<10}  {ansi.c_dim()}({disk_dev}){ansi.c_reset()}")
 
-                print("-" * min(cols, 90))
+                print("-" * min(usable, 96))
 
-                # Temps / fan
+                # Temps / fan / throttling
                 cpu_t = temps.get("cpu")
                 ssd_t = temps.get("ssd")
                 wifi_t = temps.get("wifi")
@@ -1804,15 +2122,27 @@ def run_live_cockpit(argv: list[str]) -> int:
                 wifi_t_s = f"{wifi_t:.1f}°C" if isinstance(wifi_t, (int, float)) else "-"
                 fan_s = f"{int(fan)} RPM" if isinstance(fan, (int, float)) and fan else "-"
 
+                th = thr.read()
+                thr_txt = "N/A"
+                thr_col = ansi.c_dim()
+                if th.get("ok"):
+                    if th.get("active"):
+                        thr_txt = "THROTTLING"
+                        thr_col = ansi.c_red()
+                    else:
+                        thr_txt = "OK"
+                        thr_col = ansi.c_green()
+
                 print(
                     f"{ansi.c_bold()} TEMP{ansi.c_reset()} "
                     f"CPU:{_col_by_temp(cpu_t)}{cpu_t_s}{ansi.c_reset()}   "
                     f"NVMe:{_col_by_temp(ssd_t)}{ssd_t_s}{ansi.c_reset()}   "
                     f"WiFi:{_col_by_temp(wifi_t)}{wifi_t_s}{ansi.c_reset()}   "
-                    f"{ansi.c_dim()}Fan:{ansi.c_reset()} {fan_s}"
+                    f"{ansi.c_dim()}Fan:{ansi.c_reset()} {fan_s}   "
+                    f"{ansi.c_dim()}Throttle:{ansi.c_reset()} {thr_col}{thr_txt}{ansi.c_reset()}"
                 )
 
-                # Power line
+                # Power
                 lvl_txt = f"{lvl_i}%" if isinstance(lvl_i, int) else "?"
                 print(
                     f"{ansi.c_bold()} POWER{ansi.c_reset()} "
@@ -1821,17 +2151,27 @@ def run_live_cockpit(argv: list[str]) -> int:
                     f"{ansi.c_dim()}{eta}{ansi.c_reset()}"
                 )
 
-                # Network + ping line
+                # Network + quality
                 rx = _human_rate_bps(ns.rx)
                 tx = _human_rate_bps(ns.tx)
 
                 ping_ms = ping.last_ms
+                ping_avg = ping.avg()
                 jit = ping.jitter()
                 ping_txt = "TO" if ping_ms is None else f"{ping_ms:.0f}ms"
+                avg_txt = "-" if ping_avg is None else f"{ping_avg:.0f}ms"
                 jit_txt = "-" if jit is None else f"{jit:.0f}ms"
                 pcol = _col_by_ping(ping_ms)
 
-                net_line = f"{ansi.c_bold()} NET {ansi.c_reset()} ↓{rx}  ↑{tx}   Ping:{pcol}{ping_txt}{ansi.c_reset()}  Jit:{ansi.c_dim()}{jit_txt}{ansi.c_reset()}"
+                wifi_sig = wifi.get("signal_dbm") if wifi.get("ok") else None
+                q_lbl, q_col = _net_quality(ping_avg, jit, wifi_sig if isinstance(wifi_sig, (int, float)) else None)
+
+                net_line = (
+                    f"{ansi.c_bold()} NET {ansi.c_reset()} ↓{rx}  ↑{tx}   "
+                    f"Ping:{pcol}{ping_txt}{ansi.c_reset()}  Avg:{ansi.c_dim()}{avg_txt}{ansi.c_reset()}  "
+                    f"Jit:{ansi.c_dim()}{jit_txt}{ansi.c_reset()}   "
+                    f"Quality:{q_col}{q_lbl}{ansi.c_reset()}"
+                )
                 if wifi.get("ok"):
                     ssid = wifi.get("ssid") or "-"
                     sig = wifi.get("signal_dbm")
@@ -1839,17 +2179,49 @@ def run_live_cockpit(argv: list[str]) -> int:
                     net_line += f"   {ansi.c_dim()}WiFi:{ansi.c_reset()} {ssid} ({_col_by_dbm(sig)}{sig_txt}{ansi.c_reset()})"
                 print(net_line)
 
-                # Footer: hardware names
+                # DISKS (mounted-only)
+                if show_disks:
+                    print("-" * min(usable, 96))
+                    print(f"{ansi.c_bold()} DISKS {ansi.c_reset()}{ansi.c_dim()}(mounted partitions){ansi.c_reset()}")
+                    if not disk_cache:
+                        print(f"  {ansi.c_dim()}(no mounted disks found){ansi.c_reset()}")
+                    else:
+                        for d in disk_cache:
+                            pct = float(d.get('pct', 0.0))
+                            used = float(d.get('used', 0.0))
+                            total = float(d.get('total', 0.0))
+                            free = float(d.get('free', 0.0))
+                            label = str(d.get('label') or 'disk')
+                            mp = str(d.get('mount') or '-')
+
+                            # keep it narrow & readable (avoid sideways stretching)
+                            label_disp = (label[:10])
+                            mp_disp = mp
+                            if len(mp_disp) > 22:
+                                mp_disp = '…' + mp_disp[-21:]
+
+                            line = (
+                                f"  {ansi.c_bold()}{label_disp:<10}{ansi.c_reset()} "
+                                f"{ansi.c_dim()}({mp_disp}){ansi.c_reset()}  "
+                                f"{ansi.c_dim()}Free:{ansi.c_reset()} {_human_bytes(free):<9}  "
+                                f"{_draw_bar(pct, width=12)} {pct:>5.1f}%  "
+                                f"{_human_bytes(used)}/{_human_bytes(total)}"
+                            )
+                            print(line)
+
+                # Footer: hardware hints (wrapped, not sideways)
                 if not compact:
                     hw_parts = []
                     if hw_cpu:
-                        hw_parts.append(f"CPU: {hw_cpu.strip()[:52]}")
+                        hw_parts.append(f"CPU: {hw_cpu.strip()}")
                     if hw_nvme:
-                        hw_parts.append(f"NVMe: {hw_nvme.strip()[:40]}")
+                        hw_parts.append(f"NVMe: {hw_nvme.strip()}")
                     if hw_gpu:
-                        hw_parts.append(f"GPU: {hw_gpu.strip()[:52]}")
+                        hw_parts.append(f"GPU: {hw_gpu.strip()}")
                     if hw_parts:
-                        print(f"{ansi.c_dim()}{' | '.join(hw_parts)}{ansi.c_reset()}")
+                        footer = " | ".join(hw_parts)
+                        for ln in textwrap.wrap(footer, width=min(usable, 92)):
+                            print(f"{ansi.c_dim()}{ln}{ansi.c_reset()}")
 
                 print("")
                 if compact:
@@ -1857,7 +2229,7 @@ def run_live_cockpit(argv: list[str]) -> int:
                 else:
                     print(f"{ansi.c_dim()}Ctrl+C untuk keluar.{ansi.c_reset()}  {ansi.c_dim()}Tip:{ansi.c_reset()} `ai mon sensors` untuk daftar sensor lengkap.")
                     print(f"{ansi.c_dim()}Tip:{ansi.c_reset()} `sudo ai mon disk` untuk TBW/SMART detail.")
-                    print(f"{ansi.c_dim()}Tip:{ansi.c_reset()} `ai mon net` untuk diagnosa target + wifi detail.")
+                    print(f"{ansi.c_dim()}Tip:{ansi.c_reset()} `ai mon help` untuk opsi `--disk` dan tuning layout.")
 
                 time.sleep(interval)
 
@@ -1895,7 +2267,7 @@ def handle(argv: list[str], cfg: dict) -> int:
     Entry point: ai mon <mode> [args]
 
     Modes:
-      live [--interval N] [--compact] [--target HOST] [--iface IFACE]
+      live [--interval N] [--compact] [--target HOST] [--iface IFACE] [--disk "LABEL=TARGET"] [--no-disks] [--maxwidth N]
       sensors
       batt
       disk [--sudo|--deep]
@@ -1912,7 +2284,7 @@ def handle(argv: list[str], cfg: dict) -> int:
 
     if mode in ("help", "-h", "--help"):
         ansi.print_info("AI Monitor (MON)")
-        print("  ai mon live [--interval N] [--compact] [--target HOST] [--iface IFACE] : HUD realtime (ANSI).")
+        print('  ai mon live [--interval N] [--compact] [--target HOST] [--iface IFACE] [--disk "LABEL=TARGET"] [--no-disks] [--maxwidth N] : HUD realtime (ANSI).')
         print("  ai mon sensors                                                      : Daftar semua sensor/field yang bisa dibaca.")
         print("  ai mon batt                                                         : Battery health + history (time travel).")
         print("  ai mon disk [--sudo|--deep]                                         : Storage SMART/TBW + history.")
@@ -1922,13 +2294,13 @@ def handle(argv: list[str], cfg: dict) -> int:
         print("Dependency (Fedora):")
         print("  sudo dnf install python3-psutil")
         print("Optional tools (Fedora):")
-        print("  sudo dnf install lm_sensors smartmontools pciutils iw iproute")
-        print("Optional NVIDIA:")
-        print("  nvidia-smi (driver package)")
+        print("  sudo dnf install util-linux iproute iw pciutils lm_sensors smartmontools")
+        print("Optional iGPU advanced (Fedora):")
+        print("  sudo dnf install intel-gpu-tools")
         print("")
         print("Catatan sudo PATH:")
         print("  Jika `sudo ai ...` tidak ketemu, gunakan:")
-        print("    sudo env \"PATH=$PATH\" ai mon disk")
+        print('    sudo env "PATH=$PATH" ai mon disk')
         return 0
 
     if mode in ("sensors", "probe", "inventory"):
