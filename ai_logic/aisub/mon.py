@@ -2331,9 +2331,17 @@ def run_live_cockpit(argv: list[str]) -> int:
                         fixed = 2 + name_w + 3 + free_w + 3 + (bar_w + 5) + 3 + used_w + 3 + 7  # rough
                         mount_w = max(12, min(usable - fixed, 42))
 
+                        usedpct_w = bar_w + 5
                         hdr = (
-                            f"  {ansi.c_dim()}{'NAME':<{name_w}} | {'FREE':<{free_w}} | {'USED%':< (bar_w + 5)} | {'USED/TOTAL':<{used_w}} | MOUNT{ansi.c_reset()}"
+                            f"  {ansi.c_dim()}"
+                            f"{'NAME':<{name_w}} | "
+                            f"{'FREE':<{free_w}} | "
+                            f"{'USED%':<{usedpct_w}} | "
+                            f"{'USED/TOTAL':<{used_w}} | "
+                            f"MOUNT"
+                            f"{ansi.c_reset()}"
                         )
+
                         if usable >= 70:
                             print(hdr)
 
