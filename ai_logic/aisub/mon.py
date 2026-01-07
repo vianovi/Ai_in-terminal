@@ -1,5 +1,5 @@
 """
-AI-Term • MON (System Cockpit & Intelligence) — V4.0
+AI-Term • MON (System Cockpit & Intelligence) — V4.1
 
 Tujuan:
 - `ai mon live`    : HUD realtime yang clean, vertikal, dan informatif.
@@ -9,19 +9,19 @@ Tujuan:
 - `ai mon net`     : network diagnostics (ping/dns + wifi detail).
 - `ai mon net live`: live ping graph.
 
-V4.0 Update (baru):
-- Header lebih berisi: host, mode LIVE, interval, target ping, iface.
-- Intel iGPU-first monitoring:
-  - Prefer sysfs: /sys/class/drm/card*/device/gpu_busy_percent (vendor 0x8086).
-  - Optional freq: gt_cur_freq_mhz / gt_max_freq_mhz (best-effort).
-- DISKS dipindah ke section tersendiri (di bawah, sebelum hardware footer):
-  - Menampilkan partisi yang *sedang ter-mount* saja (mirip KDE System Monitor).
-  - Jika user mount partisi lain (mis. Windows), otomatis ikut tampil (tanpa scan paksa semua disk).
-  - Ada bar, persen, used/total, dan Free space.
-- Network quality label (FAST/OK/SLOW) berbasis ping average + jitter + WiFi signal.
-- CPU: tampilkan TopCPU process (opsional, throttled agar ringan).
-- Thermal throttling indicator (best-effort via sysfs thermal_throttle counters).
-- Shell safety: internal subprocess calls tidak pakai shell=True (anti-injection, lebih portable).
+V4.1 Update (baru):
+- LIVE: GPU utilization dihapus dari HUD (permission/akses iGPU tidak stabil) dan diganti CPU Freq/Speed.
+- Header dipoles: ada pemisah + warna, Load diperjelas jadi Load avg (1/5/15) + jumlah CPU.
+- TOP list dipisah dari bar CPU/RAM:
+  - Top CPU (1–3) dan Top MEM (1–3), throttled agar ringan.
+- Throttle indicator dirapihin:
+  - Line sendiri, delta-based (ACTIVE hanya jika counter naik pada interval).
+- Fan output dirapihin:
+  - "Idle/Low/Med/High (RPM)" atau "N/A".
+- Network dipecah 2 baris (NET + PING) supaya tidak melebar.
+- DISKS dirapihin jadi tabel aligned dengan separator '|':
+  - Kolom MOUNT digeser ke paling kanan.
+  - Trimming mountpoint aman agar tampilan tetap vertikal.
 
 Catatan desain:
 - Dependency utama: `psutil` (Wajib untuk monitoring).
@@ -51,6 +51,7 @@ History file:
 from __future__ import annotations
 
 import os
+import re
 import time
 import json
 import shutil
@@ -84,6 +85,27 @@ except Exception:
 # ==========================================================
 # 0) UTILITIES (safe io, shell, formatting)
 # ==========================================================
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+def _vis_len(s: str) -> int:
+    return len(_ANSI_RE.sub("", s))
+
+def _align_lr(left: str, right: str, width: int) -> str:
+    """Align left/right text into a single line for given terminal width (ansi-aware)."""
+    w = max(20, int(width))
+    l = _vis_len(left)
+    r = _vis_len(right)
+    if l + 1 + r >= w:
+        # Hard truncate left if needed
+        keep = max(5, w - (r + 1))
+        # naive trunc (visible); best-effort
+        raw = _ANSI_RE.sub("", left)
+        if len(raw) > keep:
+            raw = raw[: max(2, keep - 1)] + "…"
+        left2 = raw
+        return left2 + " " + right
+    return left + (" " * (w - (l + r))) + right
 
 def _now_ts() -> str:
     return _dt.datetime.now().strftime("%A | %H:%M:%S")
@@ -207,6 +229,22 @@ def _distro_pretty() -> str:
             v = ln.split("=", 1)[1].strip().strip('"')
             return v
     return ""
+
+def _trim_tail(s: str, maxlen: int) -> str:
+    """Trim long strings from the left, keeping the tail (useful for mount paths)."""
+    s = s or ""
+    maxlen = int(max(8, maxlen))
+    if len(s) <= maxlen:
+        return s
+    return "…" + s[-(maxlen - 1):]
+
+def _trim_name(s: str, maxlen: int) -> str:
+    """Trim long process/labels, keeping head (better for names)."""
+    s = (s or "").strip()
+    maxlen = int(max(4, maxlen))
+    if len(s) <= maxlen:
+        return s
+    return s[: max(2, maxlen - 1)] + "…"
 
 
 # ==========================================================
@@ -774,6 +812,7 @@ class SwapReader:
             pass
         return out
 
+
 # ==========================================================
 # 4) DISK I/O SAMPLER (Active Time + R/W Speed via sysfs stat)
 # ==========================================================
@@ -849,10 +888,9 @@ def _pick_root_disk_dev() -> Optional[str]:
     - lsblk -no PKNAME to get parent disk
     - fallback: prefer nvme0n1, else first disk from lsblk
     """
-    # try find root source
     src = ""
     try:
-        code, out = _run(['findmnt','-n','-o','SOURCE','/'], timeout=2)
+        code, out = _run(["findmnt", "-n", "-o", "SOURCE", "/"], timeout=2)
         if code == 0 and out:
             src = out.strip()
     except Exception:
@@ -860,33 +898,28 @@ def _pick_root_disk_dev() -> Optional[str]:
 
     if src.startswith("/dev/"):
         base = os.path.basename(src)
-        # if partition like nvme0n1p2 -> parent disk nvme0n1
-        code, out = _run(['lsblk','-no','PKNAME', f'/dev/{base}'], timeout=2)
+        code, out = _run(["lsblk", "-no", "PKNAME", f"/dev/{base}"], timeout=2)
         if code == 0 and out.strip():
             return out.strip()
-        # maybe already disk
         if Path(f"/sys/block/{base}").exists():
             return base
 
-    # fallback: prefer nvme0n1
     if Path("/sys/block/nvme0n1").exists():
         return "nvme0n1"
 
-    # fallback: first disk from lsblk
-    if shutil.which('lsblk'):
-        code, out = _run(['lsblk','-d','-n','-o','NAME,TYPE'], timeout=2)
+    if shutil.which("lsblk"):
+        code, out = _run(["lsblk", "-d", "-n", "-o", "NAME,TYPE"], timeout=2)
         if code == 0 and out:
             for ln in out.splitlines():
                 parts = ln.split()
-                if len(parts) >= 2 and parts[1] == 'disk':
+                if len(parts) >= 2 and parts[1] == "disk":
                     return parts[0].strip()
-
 
     return None
 
 
 # ==========================================================
-# 5) GPU READER (Intel iGPU-first)
+# 5) GPU READER (Intel iGPU-first) — (kept for sensors/probe; not used in LIVE HUD)
 # ==========================================================
 
 class GPUReader:
@@ -917,7 +950,6 @@ class GPUReader:
 
     @staticmethod
     def _read_freq_mhz(dev: Path) -> tuple[Optional[int], Optional[int]]:
-        # best-effort across kernel variants
         cand_cur = [dev / "gt_cur_freq_mhz", dev / "device" / "gt_cur_freq_mhz"]
         cand_max = [dev / "gt_max_freq_mhz", dev / "device" / "gt_max_freq_mhz"]
         cur = None
@@ -955,7 +987,6 @@ class GPUReader:
 
     @staticmethod
     def gpu_name_hint() -> str:
-        # Prefer lspci if available, but parse without pipes.
         if shutil.which("lspci"):
             code, out = _run(["lspci"], timeout=3)
             if code == 0 and out:
@@ -1146,7 +1177,7 @@ def run_sensors_dump() -> int:
         if len(devs) > 40:
             print(f"  {ansi.c_dim()}...({len(devs)-40} lainnya){ansi.c_reset()}")
 
-    print(f"\n{ansi.c_dim()}Tip:{ansi.c_reset()} HUD paling berguna: CPU package, NVMe composite, watt/volt/amp, swap, disk active%+R/W, gpu%, wifi ssid/signal, throughput, ping/jitter.")
+    print(f"\n{ansi.c_dim()}Tip:{ansi.c_reset()} HUD paling berguna: CPU package, NVMe composite, watt/volt/amp, swap, disk active%+R/W, wifi ssid/signal, throughput, ping/jitter.")
     return 0
 
 
@@ -1205,9 +1236,9 @@ def run_battery_check() -> int:
 
 
 def _lsblk_disks() -> list[dict[str, str]]:
-    if not shutil.which('lsblk'):
+    if not shutil.which("lsblk"):
         return []
-    code, out = _run(['lsblk','-J','-d','-o','NAME,MODEL,SIZE,TYPE,TRAN,ROTA'], timeout=3)
+    code, out = _run(["lsblk", "-J", "-d", "-o", "NAME,MODEL,SIZE,TYPE,TRAN,ROTA"], timeout=3)
     if code != 0 or not out:
         return []
     try:
@@ -1218,7 +1249,7 @@ def _lsblk_disks() -> list[dict[str, str]]:
             if x.get("type") != "disk":
                 continue
             name = str(x.get("name") or "")
-            if name.startswith("loop") or name.startswith("zram") or name.startswith("sr"):
+            if name.startswith(("loop", "zram", "sr")):
                 continue
             res.append({
                 "name": name,
@@ -1538,7 +1569,7 @@ def run_net_live(argv: list[str]) -> int:
 
 
 # ==========================================================
-# 8) LIVE COCKPIT (HUD V4.0)
+# 8) LIVE COCKPIT (HUD V4.1)
 # ==========================================================
 
 _IGNORED_FS_TYPES = {
@@ -1566,20 +1597,16 @@ def _mounted_partitions() -> list[dict[str, str]]:
             continue
         if fstype in _IGNORED_FS_TYPES:
             continue
-        # Skip pseudo mounts by mountpoint
         if mp.startswith(("/proc", "/sys", "/dev")):
             continue
-        # /run/media is a legit user-mount location (e.g., dual-boot partitions opened via Dolphin)
         if mp.startswith("/run") and not mp.startswith("/run/media"):
             continue
-        # Skip loop devices etc
         bdev = os.path.basename(dev)
         if bdev.startswith(("loop", "zram", "ram", "sr")):
             continue
 
         items.append({"mount": mp, "device": dev, "fstype": fstype})
 
-    # prefer stable ordering: root, home, then others
     def _key(x: dict[str, str]) -> tuple[int, str]:
         mp = x.get("mount", "")
         if mp == "/":
@@ -1629,15 +1656,12 @@ def _resolve_disk_target(target: str, mounts: list[dict[str, str]]) -> Optional[
     t = target.strip()
     if not t:
         return None
-    # direct mountpoint
     for m in mounts:
         if m["mount"] == t:
             return m["mount"]
-    # device path match
     for m in mounts:
         if m["device"] == t:
             return m["mount"]
-    # bare device name match
     for m in mounts:
         if os.path.basename(m["device"]) == t:
             return m["mount"]
@@ -1657,7 +1681,6 @@ def _net_quality(ping_avg_ms: Optional[float], jitter_ms: Optional[float], wifi_
             score += 2
         elif jitter_ms <= 40:
             score += 1
-    # wifi signal only if available; wired is treated as neutral
     if isinstance(wifi_dbm, (int, float)):
         if wifi_dbm >= -60:
             score += 2
@@ -1714,15 +1737,6 @@ class ThrottleReader:
             "active": active,
         }
 
-# ==========================================================
-
-def _disk_usage_root() -> dict[str, Any]:
-    try:
-        du = shutil.disk_usage("/")
-        used_pct = (du.used / du.total) * 100.0 if du.total else 0.0
-        return {"ok": True, "used_pct": used_pct, "used": du.used, "total": du.total}
-    except Exception:
-        return {"ok": False}
 
 def _uptime_str() -> str:
     if psutil is not None:
@@ -1747,81 +1761,169 @@ def _uptime_str() -> str:
     except Exception:
         return "?"
 
-def _loadavg_str() -> str:
+def _loadavg() -> tuple[float, float, float]:
     try:
         la = os.getloadavg()
-        return f"{la[0]:.2f} {la[1]:.2f} {la[2]:.2f}"
+        return float(la[0]), float(la[1]), float(la[2])
     except Exception:
-        return "-"
+        return 0.0, 0.0, 0.0
 
 def _cpu_model() -> str:
     try:
-        txt = _read_text(Path('/proc/cpuinfo'))
+        txt = _read_text(Path("/proc/cpuinfo"))
         for ln in txt.splitlines():
-            if ln.lower().startswith('model name'): 
-                return ln.split(':', 1)[-1].strip()
+            if ln.lower().startswith("model name"):
+                return ln.split(":", 1)[-1].strip()
     except Exception:
         pass
-    return ''
+    return ""
 
 def _nvme_model_hint(dev: Optional[str]) -> str:
     if not dev:
-        return ''
-    # Prefer sysfs model if available
-    sys_p = Path(f'/sys/block/{dev}/device/model')
+        return ""
+    sys_p = Path(f"/sys/block/{dev}/device/model")
     if sys_p.exists():
         return _read_text(sys_p)
-    # Fallback lsblk without pipes
-    if shutil.which('lsblk'):
-        code, out = _run(['lsblk','-d','-n','-o','MODEL', f'/dev/{dev}'], timeout=2)
+    if shutil.which("lsblk"):
+        code, out = _run(["lsblk", "-d", "-n", "-o", "MODEL", f"/dev/{dev}"], timeout=2)
         if code == 0 and out:
             return out.splitlines()[0].strip()
-    return ''
+    return ""
 
-def _topmem_process() -> str:
-    if psutil is None:
-        return "-"
+def _fan_label(rpm: Optional[int]) -> str:
+    if not isinstance(rpm, int) or rpm <= 0:
+        return f"{ansi.c_dim()}N/A{ansi.c_reset()}"
+    # Simple bands; adjustable if needed
+    if rpm < 2500:
+        lvl = f"{ansi.c_green()}Idle{ansi.c_reset()}"
+    elif rpm < 4500:
+        lvl = f"{ansi.c_green()}Low{ansi.c_reset()}"
+    elif rpm < 6500:
+        lvl = f"{ansi.c_yellow()}Med{ansi.c_reset()}"
+    else:
+        lvl = f"{ansi.c_red()}High{ansi.c_reset()}"
+    return f"{lvl}{ansi.c_dim()} ({rpm} RPM){ansi.c_reset()}"
+
+def _cpu_freq_info() -> dict[str, Any]:
+    """
+    Best-effort CPU frequency + governor.
+    Returns:
+      {"ok": bool, "ghz": float|None, "gov": str|None}
+    """
+    gov = None
+    gov_p = Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+    if gov_p.exists():
+        g = _read_text(gov_p).strip()
+        gov = g or None
+
+    # Prefer sysfs scaling_cur_freq across available CPUs (kHz)
+    vals: list[float] = []
+    base = Path("/sys/devices/system/cpu")
     try:
-        best = None
+        for p in sorted(base.glob("cpu[0-9]*/cpufreq/scaling_cur_freq")):
+            v = _read_int(p)
+            if isinstance(v, int) and v > 0:
+                # kHz -> GHz
+                vals.append(float(v) / 1e6)
+    except Exception:
+        vals = []
+
+    if vals:
+        return {"ok": True, "ghz": sum(vals) / len(vals), "gov": gov}
+
+    # Fallback psutil
+    if psutil is not None:
+        try:
+            fr = psutil.cpu_freq()
+            if fr and getattr(fr, "current", None):
+                mhz = float(fr.current)
+                return {"ok": True, "ghz": mhz / 1000.0, "gov": gov}
+        except Exception:
+            pass
+
+    # Fallback /proc/cpuinfo average MHz (may be noisy)
+    try:
+        txt = _read_text(Path("/proc/cpuinfo"))
+        mhz_vals: list[float] = []
+        for ln in txt.splitlines():
+            if ln.lower().startswith("cpu mhz"):
+                try:
+                    mhz_vals.append(float(ln.split(":", 1)[-1].strip()))
+                except Exception:
+                    continue
+        if mhz_vals:
+            return {"ok": True, "ghz": (sum(mhz_vals) / len(mhz_vals)) / 1000.0, "gov": gov}
+    except Exception:
+        pass
+
+    return {"ok": False, "ghz": None, "gov": gov}
+
+def _topmem_processes(n: int = 3) -> list[tuple[str, float]]:
+    """Return list of (name, rss_gib)."""
+    if psutil is None:
+        return []
+    try:
+        rows: list[tuple[str, float]] = []
         for p in psutil.process_iter(attrs=["name", "memory_info"]):
             mi = p.info.get("memory_info")
             rss = getattr(mi, "rss", 0) if mi else 0
-            if best is None or rss > best[0]:
-                best = (rss, p.info.get("name") or "?")
-        if not best:
-            return "-"
-        return f"{best[1]} ({best[0]/(1024**3):.1f}GB)"
+            if rss and rss > 0:
+                rows.append((p.info.get("name") or "?", float(rss) / (1024.0**3)))
+        rows.sort(key=lambda x: x[1], reverse=True)
+        return rows[: max(0, int(n))]
     except Exception:
-        return "-"
+        return []
 
-def _topcpu_process(total_cpu_pct: float) -> str:
-    """Return top CPU process string. Throttled by caller."""
+def _topcpu_processes(total_cpu_pct: float, n: int = 3) -> list[tuple[str, float, float]]:
+    """
+    Return list of (name, cpu_pct, share_of_total_cpu_pct).
+    Note: caller must have primed p.cpu_percent(None) earlier (done in run_live_cockpit).
+    """
     if psutil is None:
-        return "-"
+        return []
     try:
-        best_pct = 0.0
-        best_name = "?"
+        rows: list[tuple[str, float, float]] = []
         for p in psutil.process_iter(attrs=["name"]):
             try:
                 pct = float(p.cpu_percent(interval=None) or 0.0)
             except Exception:
                 continue
-            if pct > best_pct:
-                best_pct = pct
-                best_name = (p.info.get("name") or "?")
-        if best_pct <= 0.0:
-            return "-"
-        share = 0.0
-        if total_cpu_pct > 0.1:
-            share = (best_pct / total_cpu_pct) * 100.0
-        share = _clamp(share, 0.0, 100.0)
-        return f"{best_name} {best_pct:.1f}% ({share:.0f}% of CPU)"
+            if pct <= 0.0:
+                continue
+            share = 0.0
+            if total_cpu_pct > 0.1:
+                share = (pct / total_cpu_pct) * 100.0
+            share = _clamp(share, 0.0, 100.0)
+            rows.append(((p.info.get("name") or "?"), pct, share))
+        rows.sort(key=lambda x: x[1], reverse=True)
+        return rows[: max(0, int(n))]
     except Exception:
-        return "-"
+        return []
 
+def _fmt_topcpu(rows: list[tuple[str, float, float]], name_w: int = 16) -> list[str]:
+    out: list[str] = []
+    for i, (nm, pct, share) in enumerate(rows, start=1):
+        nm2 = _trim_name(nm, name_w)
+        if i == 1:
+            out.append(f"  {i}) {nm2:<{name_w}} {pct:>5.1f}%   {ansi.c_dim()}(≈{share:.0f}% of total){ansi.c_reset()}")
+        else:
+            out.append(f"  {i}) {nm2:<{name_w}} {pct:>5.1f}%")
+    return out
+
+def _fmt_topmem(rows: list[tuple[str, float]], name_w: int = 16) -> list[str]:
+    out: list[str] = []
+    for i, (nm, gib) in enumerate(rows, start=1):
+        nm2 = _trim_name(nm, name_w)
+        out.append(f"  {i}) {nm2:<{name_w}} {gib:>5.2f} GiB")
+    return out
+
+
+# ==========================================================
+# 9) LIVE COCKPIT runner
+# ==========================================================
 
 def run_live_cockpit(argv: list[str]) -> int:
-    """HUD realtime (V4.0).
+    """HUD realtime (V4.1).
 
     Options:
       --interval N           (float)
@@ -1837,7 +1939,6 @@ def run_live_cockpit(argv: list[str]) -> int:
         print("Install Fedora: sudo dnf install python3-psutil")
         return 1
 
-    # parse custom disk specs first
     disk_specs, argv2 = _parse_disk_specs(argv)
 
     interval = 1.0
@@ -1873,7 +1974,6 @@ def run_live_cockpit(argv: list[str]) -> int:
                 maxwidth = None
             i += 1
         else:
-            # numeric shortcut: ai mon live 0.5
             if i == 0:
                 try:
                     interval = float(a)
@@ -1896,14 +1996,12 @@ def run_live_cockpit(argv: list[str]) -> int:
 
     thr = ThrottleReader()
 
-    # caches/throttles
     last_snap = 0.0
     SNAP_EVERY = 600.0
 
     last_hw = 0.0
     HW_EVERY = 30.0
     hw_cpu = ""
-    hw_gpu = ""
     hw_nvme = ""
     distro = _distro_pretty()
     kernel = _uname_kernel()
@@ -1911,12 +2009,16 @@ def run_live_cockpit(argv: list[str]) -> int:
 
     last_top = 0.0
     TOP_EVERY = 5.0
-    topmem = "-"
-    topcpu = "-"
+    top_cpu_rows: list[str] = []
+    top_mem_rows: list[str] = []
 
     last_disks = 0.0
     DISK_EVERY = 10.0
     disk_cache: list[dict[str, Any]] = []
+
+    last_freq = 0.0
+    FREQ_EVERY = 2.0
+    cpu_freq_str = f"{ansi.c_dim()}N/A{ansi.c_reset()}"
 
     input_muter = ansi.MuteInputDuringWait()
     ansi.alt_screen_enter()
@@ -1960,20 +2062,33 @@ def run_live_cockpit(argv: list[str]) -> int:
 
                 sw = SwapReader.read()
                 temps = ThermalReader.read_key_temps()
-                fan = ThermalReader.read_fan_rpm()
+                fan_rpm = ThermalReader.read_fan_rpm()
                 power = pr.read()
-                wifi = WiFiReader.read()
-
+                wifi = WiFiReader.read(iface=iface)  # honor iface if it's wifi
                 ns.update()
                 if disk_io:
                     disk_io.update()
 
-                gpu = GPUReader.read_usage_pct()
+                # throttled CPU freq
+                if time.time() - last_freq >= FREQ_EVERY:
+                    fi = _cpu_freq_info()
+                    if fi.get("ok") and isinstance(fi.get("ghz"), (int, float)):
+                        ghz = float(fi["ghz"])
+                        gov = fi.get("gov") or ""
+                        gov_txt = f"{ansi.c_dim()}({gov}){ansi.c_reset()}" if gov else ""
+                        cpu_freq_str = f"{ghz:.2f} GHz {gov_txt}".rstrip()
+                    else:
+                        gov = fi.get("gov") or ""
+                        gov_txt = f"{ansi.c_dim()}({gov}){ansi.c_reset()}" if gov else ""
+                        cpu_freq_str = f"{ansi.c_dim()}N/A{ansi.c_reset()} {gov_txt}".rstrip()
+                    last_freq = time.time()
 
                 # throttled top processes
                 if time.time() - last_top >= TOP_EVERY:
-                    topmem = _topmem_process()
-                    topcpu = _topcpu_process(cpu)
+                    t_cpu = _topcpu_processes(cpu, n=3)
+                    t_mem = _topmem_processes(n=3)
+                    top_cpu_rows = _fmt_topcpu(t_cpu, name_w=16) if t_cpu else [f"  {ansi.c_dim()}(no data){ansi.c_reset()}"]
+                    top_mem_rows = _fmt_topmem(t_mem, name_w=16) if t_mem else [f"  {ansi.c_dim()}(no data){ansi.c_reset()}"]
                     last_top = time.time()
 
                 # throttled disks inventory (mounted-only)
@@ -1981,7 +2096,6 @@ def run_live_cockpit(argv: list[str]) -> int:
                     mounts = _mounted_partitions()
                     disk_cache = []
 
-                    # apply user specs (label overrides)
                     overrides: dict[str, str] = {}
                     for label, target_spec in disk_specs:
                         mp = _resolve_disk_target(target_spec, mounts)
@@ -2012,7 +2126,6 @@ def run_live_cockpit(argv: list[str]) -> int:
                 # throttled hardware footer
                 if time.time() - last_hw >= HW_EVERY:
                     hw_cpu = _cpu_model()
-                    hw_gpu = GPUReader.gpu_name_hint()
                     hw_nvme = _nvme_model_hint(disk_dev)
                     last_hw = time.time()
 
@@ -2064,55 +2177,62 @@ def run_live_cockpit(argv: list[str]) -> int:
                 # render
                 ansi.clear_screen()
 
-                title_left = f"{ansi.c_cyan()}{ansi.c_bold()} AI MONITOR {ansi.c_reset()}"                              f"{ansi.c_dim()}• LIVE SYSTEM COCKPIT{ansi.c_reset()}"
+                # Header (polished + colored + separated)
+                title_left = f"{ansi.c_cyan()}{ansi.c_bold()}AI MONITOR{ansi.c_reset()} {ansi.c_dim()}| LIVE SYSTEM COCKPIT{ansi.c_reset()}"
                 title_right = f"{ansi.c_dim()}AI-Terminal{ansi.c_reset()}"
-                gap = max(1, usable - (len(' AI MONITOR ')+len('• LIVE SYSTEM COCKPIT')+len('AI-Terminal')+10))
-                print(f"{title_left}{' ' * gap}{title_right}")
+                print(_align_lr(title_left, title_right, usable))
+
+                sep = f"{ansi.c_dim()}{'─' * min(usable, 96)}{ansi.c_reset()}"
 
                 ts = _now_ts()
-                meta = f"Host: {host}   Interval: {interval:.1f}s   Target: {target}"
+                meta = f"{ansi.c_dim()}{ts}{ansi.c_reset()}  {ansi.c_dim()}|{ansi.c_reset()}  Host: {host}  Interval: {interval:.1f}s  Target: {target}"
                 if iface:
-                    meta += f"   Iface: {iface}"
-                print(f"{ansi.c_dim()}{ts}{ansi.c_reset()}  {ansi.c_dim()}|{ansi.c_reset()}  {meta}")
+                    meta += f"  Iface: {iface}"
+                print(meta)
 
-                line_os = f"OS: {distro or '-'}   Kernel: {kernel}"
-                line_sys = f"Uptime: {_uptime_str()}   Load: {_loadavg_str()}"
-                print(f"{ansi.c_dim()}{line_os}{ansi.c_reset()}")
-                print(f"{ansi.c_dim()}{line_sys}{ansi.c_reset()}")
-                print("-" * min(usable, 96))
+                line_os = f"OS: {distro or '-'}"
+                line_kr = f"Kernel: {kernel}"
+                print(f"{ansi.c_dim()}{line_os:<36}  {line_kr}{ansi.c_reset()}")
 
-                # CPU / RAM / SWAP / GPU
-                print(f"{ansi.c_bold()} CPU {ansi.c_reset()} {_draw_bar(cpu)} {cpu:>5.1f}%   {ansi.c_dim()}TopCPU:{ansi.c_reset()} {topcpu}")
-                print(f"{ansi.c_bold()} RAM {ansi.c_reset()} {_draw_bar(ram_pct)} {ram_pct:>5.1f}%   {ram_used/(1024**3):.1f}/{ram_total/(1024**3):.1f} GB   {ansi.c_dim()}TopMem:{ansi.c_reset()} {topmem}")
+                la1, la5, la15 = _loadavg()
+                cpu_count = os.cpu_count() or 1
+                load_line = f"Uptime: {_uptime_str()}   Load avg (1/5/15): {la1:.2f}/{la5:.2f}/{la15:.2f}   CPUs: {cpu_count}"
+                print(f"{ansi.c_dim()}{load_line}{ansi.c_reset()}")
+                print(sep)
+
+                # CPU / RAM / SWAP / I/O (no Top here; moved below)
+                print(f"{ansi.c_bold()} CPU {ansi.c_reset()} {_draw_bar(cpu)} {cpu:>5.1f}%   {ansi.c_dim()}Freq:{ansi.c_reset()} {cpu_freq_str}")
+                print(f"{ansi.c_bold()} RAM {ansi.c_reset()} {_draw_bar(ram_pct)} {ram_pct:>5.1f}%   {ram_used/(1024**3):.1f}/{ram_total/(1024**3):.1f} GiB")
 
                 if sw.get("ok") and sw.get("total", 0) > 0:
                     sw_pct = float(sw.get("pct", 0.0))
                     sw_used = int(sw.get("used", 0))
                     sw_total = int(sw.get("total", 0))
-                    print(f"{ansi.c_bold()} SWAP{ansi.c_reset()} {_draw_bar(sw_pct)} {sw_pct:>5.1f}%   {_human_bytes(sw_used)}/{_human_bytes(sw_total)}")
+                    print(f"{ansi.c_bold()}SWAP {ansi.c_reset()} {_draw_bar(sw_pct)} {sw_pct:>5.1f}%   {_human_bytes(sw_used)}/{_human_bytes(sw_total)}")
                 else:
-                    print(f"{ansi.c_bold()} SWAP{ansi.c_reset()} {ansi.c_dim()}(not available){ansi.c_reset()}")
+                    print(f"{ansi.c_bold()}SWAP {ansi.c_reset()} {ansi.c_dim()}(not available){ansi.c_reset()}")
 
-                if gpu.get("ok") and isinstance(gpu.get("pct"), (int, float)):
-                    gp = float(gpu["pct"])
-                    freq = ""
-                    if isinstance(gpu.get("freq_cur_mhz"), int) and isinstance(gpu.get("freq_max_mhz"), int):
-                        freq = f"   {ansi.c_dim()}Freq:{ansi.c_reset()} {gpu['freq_cur_mhz']}/{gpu['freq_max_mhz']} MHz"
-                    print(f"{ansi.c_bold()} GPU {ansi.c_reset()} {_draw_bar(gp)} {gp:>5.1f}%   {ansi.c_dim()}Intel iGPU{ansi.c_reset()}{freq}")
-                else:
-                    print(f"{ansi.c_bold()} GPU {ansi.c_reset()} {ansi.c_dim()}(intel iGPU usage sensor N/A){ansi.c_reset()}")
-
-                # I/O (active time + rw speed) — optional, root disk only
                 if disk_io and disk_dev:
                     util = float(disk_io.active_pct)
                     col_u = ansi.c_green() if util <= 60 else (ansi.c_yellow() if util <= 85 else ansi.c_red())
                     r = _human_rate_bps(disk_io.read_bps)
                     w = _human_rate_bps(disk_io.write_bps)
-                    print(f"{ansi.c_bold()} I/O {ansi.c_reset()} {col_u}{util:>5.1f}%{ansi.c_reset()}  R:{r:<10}  W:{w:<10}  {ansi.c_dim()}({disk_dev}){ansi.c_reset()}")
+                    print(f"{ansi.c_bold()} I/O {ansi.c_reset()} {col_u}{util:>5.1f}%{ansi.c_reset()}  R:{r:<11}  W:{w:<11}  {ansi.c_dim()}({disk_dev}){ansi.c_reset()}")
 
-                print("-" * min(usable, 96))
+                print(sep)
 
-                # Temps / fan / throttling
+                # Top lists
+                print(f"{ansi.c_bold()}Top CPU (1–3){ansi.c_reset()}")
+                for ln in top_cpu_rows:
+                    print(ln)
+                print("")
+                print(f"{ansi.c_bold()}Top MEM (1–3){ansi.c_reset()}")
+                for ln in top_mem_rows:
+                    print(ln)
+
+                print(sep)
+
+                # Temps + Fan (fan label)
                 cpu_t = temps.get("cpu")
                 ssd_t = temps.get("ssd")
                 wifi_t = temps.get("wifi")
@@ -2120,44 +2240,54 @@ def run_live_cockpit(argv: list[str]) -> int:
                 cpu_t_s = f"{cpu_t:.1f}°C" if isinstance(cpu_t, (int, float)) else "-"
                 ssd_t_s = f"{ssd_t:.1f}°C" if isinstance(ssd_t, (int, float)) else "-"
                 wifi_t_s = f"{wifi_t:.1f}°C" if isinstance(wifi_t, (int, float)) else "-"
-                fan_s = f"{int(fan)} RPM" if isinstance(fan, (int, float)) and fan else "-"
 
-                th = thr.read()
-                thr_txt = "N/A"
-                thr_col = ansi.c_dim()
-                if th.get("ok"):
-                    if th.get("active"):
-                        thr_txt = "THROTTLING"
-                        thr_col = ansi.c_red()
-                    else:
-                        thr_txt = "OK"
-                        thr_col = ansi.c_green()
+                fan_s = _fan_label(int(fan_rpm) if isinstance(fan_rpm, (int, float)) else None)
 
                 print(
-                    f"{ansi.c_bold()} TEMP{ansi.c_reset()} "
+                    f"{ansi.c_bold()}TEMP {ansi.c_reset()}"
                     f"CPU:{_col_by_temp(cpu_t)}{cpu_t_s}{ansi.c_reset()}   "
                     f"NVMe:{_col_by_temp(ssd_t)}{ssd_t_s}{ansi.c_reset()}   "
                     f"WiFi:{_col_by_temp(wifi_t)}{wifi_t_s}{ansi.c_reset()}   "
-                    f"{ansi.c_dim()}Fan:{ansi.c_reset()} {fan_s}   "
-                    f"{ansi.c_dim()}Throttle:{ansi.c_reset()} {thr_col}{thr_txt}{ansi.c_reset()}"
+                    f"{ansi.c_dim()}Fan:{ansi.c_reset()} {fan_s}"
                 )
+
+                # Throttle (separate line)
+                th = thr.read()
+                if th.get("ok"):
+                    if th.get("active"):
+                        dc = th.get("delta_core")
+                        dp = th.get("delta_pkg")
+                        parts = []
+                        if isinstance(dc, int) and dc > 0:
+                            parts.append(f"+core {dc}")
+                        if isinstance(dp, int) and dp > 0:
+                            parts.append(f"+pkg {dp}")
+                        extra = f" {ansi.c_dim()}({', '.join(parts)}){ansi.c_reset()}" if parts else ""
+                        print(f"{ansi.c_bold()}THROT{ansi.c_reset()} {ansi.c_red()}ACTIVE{ansi.c_reset()}{extra}")
+                    else:
+                        print(f"{ansi.c_bold()}THROT{ansi.c_reset()} {ansi.c_green()}OK{ansi.c_reset()}")
+                else:
+                    print(f"{ansi.c_bold()}THROT{ansi.c_reset()} {ansi.c_dim()}N/A{ansi.c_reset()}")
 
                 # Power
                 lvl_txt = f"{lvl_i}%" if isinstance(lvl_i, int) else "?"
                 print(
-                    f"{ansi.c_bold()} POWER{ansi.c_reset()} "
+                    f"{ansi.c_bold()}POWER{ansi.c_reset()} "
                     f"{bat_col}{lvl_txt}{ansi.c_reset()} [{st_txt}]   "
                     f"{ansi.c_yellow()}{power.get('watt_str','N/A')}{ansi.c_reset()} @ {power.get('volt_str','N/A')} | {power.get('amp_str','N/A')}   "
                     f"{ansi.c_dim()}{eta}{ansi.c_reset()}"
                 )
 
-                # Network + quality
+                print(sep)
+
+                # Network (2 lines)
                 rx = _human_rate_bps(ns.rx)
                 tx = _human_rate_bps(ns.tx)
 
                 ping_ms = ping.last_ms
                 ping_avg = ping.avg()
                 jit = ping.jitter()
+
                 ping_txt = "TO" if ping_ms is None else f"{ping_ms:.0f}ms"
                 avg_txt = "-" if ping_avg is None else f"{ping_avg:.0f}ms"
                 jit_txt = "-" if jit is None else f"{jit:.0f}ms"
@@ -2166,46 +2296,70 @@ def run_live_cockpit(argv: list[str]) -> int:
                 wifi_sig = wifi.get("signal_dbm") if wifi.get("ok") else None
                 q_lbl, q_col = _net_quality(ping_avg, jit, wifi_sig if isinstance(wifi_sig, (int, float)) else None)
 
-                net_line = (
-                    f"{ansi.c_bold()} NET {ansi.c_reset()} ↓{rx}  ↑{tx}   "
-                    f"Ping:{pcol}{ping_txt}{ansi.c_reset()}  Avg:{ansi.c_dim()}{avg_txt}{ansi.c_reset()}  "
-                    f"Jit:{ansi.c_dim()}{jit_txt}{ansi.c_reset()}   "
+                print(
+                    f"{ansi.c_bold()}NET  {ansi.c_reset()}↓{rx}  ↑{tx}   "
                     f"Quality:{q_col}{q_lbl}{ansi.c_reset()}"
+                )
+
+                ping_line = (
+                    f"{ansi.c_bold()}PING {ansi.c_reset()}{target}   "
+                    f"last:{pcol}{ping_txt}{ansi.c_reset()}  "
+                    f"avg:{ansi.c_dim()}{avg_txt}{ansi.c_reset()}  "
+                    f"jitter:{ansi.c_dim()}{jit_txt}{ansi.c_reset()}"
                 )
                 if wifi.get("ok"):
                     ssid = wifi.get("ssid") or "-"
                     sig = wifi.get("signal_dbm")
                     sig_txt = f"{sig:.0f} dBm" if isinstance(sig, (int, float)) else "-"
-                    net_line += f"   {ansi.c_dim()}WiFi:{ansi.c_reset()} {ssid} ({_col_by_dbm(sig)}{sig_txt}{ansi.c_reset()})"
-                print(net_line)
+                    ping_line += f"   {ansi.c_dim()}WiFi:{ansi.c_reset()} { _trim_name(ssid, 14) } ({_col_by_dbm(sig)}{sig_txt}{ansi.c_reset()})"
+                print(ping_line)
 
-                # DISKS (mounted-only)
+                # DISKS (mounted-only) — table aligned, mount at right
                 if show_disks:
-                    print("-" * min(usable, 96))
-                    print(f"{ansi.c_bold()} DISKS {ansi.c_reset()}{ansi.c_dim()}(mounted partitions){ansi.c_reset()}")
+                    print(sep)
+                    print(f"{ansi.c_bold()}DISKS{ansi.c_reset()} {ansi.c_dim()}(mounted partitions){ansi.c_reset()}")
+
                     if not disk_cache:
                         print(f"  {ansi.c_dim()}(no mounted disks found){ansi.c_reset()}")
                     else:
+                        # Column sizing (best-effort)
+                        name_w = 6
+                        free_w = 9
+                        bar_w = 10
+                        used_w = 15
+                        # Remaining for mount column
+                        fixed = 2 + name_w + 3 + free_w + 3 + (bar_w + 5) + 3 + used_w + 3 + 7  # rough
+                        mount_w = max(12, min(usable - fixed, 42))
+
+                        hdr = (
+                            f"  {ansi.c_dim()}{'NAME':<{name_w}} | {'FREE':<{free_w}} | {'USED%':< (bar_w + 5)} | {'USED/TOTAL':<{used_w}} | MOUNT{ansi.c_reset()}"
+                        )
+                        if usable >= 70:
+                            print(hdr)
+
                         for d in disk_cache:
-                            pct = float(d.get('pct', 0.0))
-                            used = float(d.get('used', 0.0))
-                            total = float(d.get('total', 0.0))
-                            free = float(d.get('free', 0.0))
-                            label = str(d.get('label') or 'disk')
-                            mp = str(d.get('mount') or '-')
+                            pct = float(d.get("pct", 0.0))
+                            used = float(d.get("used", 0.0))
+                            total = float(d.get("total", 0.0))
+                            free = float(d.get("free", 0.0))
+                            label = str(d.get("label") or "disk")
+                            mp = str(d.get("mount") or "-")
 
-                            # keep it narrow & readable (avoid sideways stretching)
-                            label_disp = (label[:10])
-                            mp_disp = mp
-                            if len(mp_disp) > 22:
-                                mp_disp = '…' + mp_disp[-21:]
+                            name_disp = _trim_name(label, name_w)
+                            free_disp = _human_bytes(free)
+                            used_disp = f"{_human_bytes(used)}/{_human_bytes(total)}"
+                            mp_disp = _trim_tail(mp, mount_w)
 
+                            bar = _draw_bar(pct, width=bar_w)
+                            pct_disp = f"{pct:>3.0f}%"
+
+                            # Align: mount at far right
                             line = (
-                                f"  {ansi.c_bold()}{label_disp:<10}{ansi.c_reset()} "
-                                f"{ansi.c_dim()}({mp_disp}){ansi.c_reset()}  "
-                                f"{ansi.c_dim()}Free:{ansi.c_reset()} {_human_bytes(free):<9}  "
-                                f"{_draw_bar(pct, width=12)} {pct:>5.1f}%  "
-                                f"{_human_bytes(used)}/{_human_bytes(total)}"
+                                f"  {ansi.c_bold()}{name_disp:<{name_w}}{ansi.c_reset()} | "
+                                f"{free_disp:<{free_w}} | "
+                                f"{bar} {pct_disp:<4} | "
+                                f"{used_disp:<{used_w}} | "
+                                f"({mp_disp})"
                             )
                             print(line)
 
@@ -2216,8 +2370,6 @@ def run_live_cockpit(argv: list[str]) -> int:
                         hw_parts.append(f"CPU: {hw_cpu.strip()}")
                     if hw_nvme:
                         hw_parts.append(f"NVMe: {hw_nvme.strip()}")
-                    if hw_gpu:
-                        hw_parts.append(f"GPU: {hw_gpu.strip()}")
                     if hw_parts:
                         footer = " | ".join(hw_parts)
                         for ln in textwrap.wrap(footer, width=min(usable, 92)):
@@ -2259,7 +2411,7 @@ def run_live_cockpit(argv: list[str]) -> int:
 
 
 # ==========================================================
-# 9) ROUTER / ENTRYPOINT
+# 10) ROUTER / ENTRYPOINT
 # ==========================================================
 
 def handle(argv: list[str], cfg: dict) -> int:
