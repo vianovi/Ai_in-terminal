@@ -1,0 +1,96 @@
+system_logic/
+  __init__.py                      # expose versi/package info (opsional)
+
+  app/
+    __init__.py
+    bridge.py                      # root dispatcher: ask|cmd|ai
+    errors.py                      # error app-level (misroute, user misuse)
+
+  core/
+    __init__.py
+    config.py                      # load/merge/validate config
+    paths.py                       # path constants (config, memory, history, dsb)
+    storage.py                     # atomic json read/write + lock
+    routing.py                     # memilih backend/provider + model per mode
+    memory.py                      # load/save context memory
+    last_error.py                  # record/read last error
+    exec.py                        # run argv / run shell safely
+    safety.py                      # evaluate command safety policy
+    types.py                       # dataclass/TypedDict: Config, RouteInfo, dsb
+    utils.py                       # helper umum (text normalize, small utils)
+
+  backends/
+    __init__.py
+    base.py                        # interface backend (ask/cmd/chat)
+    api_openai.py                  # OpenAI API
+    api_gemini.py                  # Gemini API
+    local_ollama.py                # Ollama local
+    errors.py                      # backend exceptions (AuthError, RateLimit, dsb)
+
+  terminal/
+    __init__.py
+    ansi.py                        # terminal primitives (colors, cursor, alt-screen, spinner)
+    text.py                        # wrap/strip_ansi/width helpers
+    input.py                       # input helpers (mute, confirm, readkey)
+    layout.py                      # helper layout generic (columns, tables, bars)
+
+  commands/
+    __init__.py
+
+    ask/
+      __init__.py
+      command.py                   # handle(argv, cfg) -> exit code
+      ui.py                        # output formatting ask (help/result/errors)
+      prompts.py                   # prompt templates ask
+      types.py                     # ask-specific data structures (optional)
+
+    cmd/
+      __init__.py
+      command.py                   # handle(argv, cfg)
+      ui.py                        # output formatting cmd
+      prompts.py                   # prompt templates cmd (optional)
+      planner.py                   # build/validate command plan (optional)
+      types.py                     # cmd-specific data structures (optional)
+
+    ai/
+      __init__.py
+      command.py                   # handle(argv, cfg) -> dispatch subcommands
+      ui.py                        # ai root help + error display
+
+      subcommands/
+        __init__.py
+        registry.py                # register + dispatch subcommands
+        types.py                   # SubcommandSpec, Result, etc
+
+        help/
+          __init__.py
+          command.py               # ai help (subcommand)
+          ui.py                    # ui untuk help output
+
+        status/
+          __init__.py
+          command.py               # ai status (subcommand)
+          ui.py                    # ui untuk status output
+
+        mon/
+          __init__.py
+          command.py               # ai mon (logic/dispatcher mon modes)
+          ui.py                    # mon UI rendering (cockpit/net/battery/disk)
+          history.py               # history engine khusus mon (optional)
+          readers.py               # collectors/sensors parsing (optional)
+          types.py                 # dataclass snapshot (optional)
+
+        gitx/
+          __init__.py
+          command.py
+          ui.py
+
+        ghx/
+          __init__.py
+          command.py
+          ui.py
+
+        run/
+          __init__.py
+          command.py
+          ui.py

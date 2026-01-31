@@ -1,0 +1,86 @@
+AI_in-terminal
+|
+├── ai_logic
+│   ├── ai.py
+│   ├── aisub
+│   │   ├── ghx.py
+│   │   ├── gitx.py
+│   │   ├── help.py
+│   │   ├── mon.py
+│   │   ├── __pycache__
+│   │   │   ├── ghx.cpython-314.pyc
+│   │   │   ├── gitx.cpython-314.pyc
+│   │   │   ├── help.cpython-314.pyc
+│   │   │   ├── mon.cpython-314.pyc
+│   │   │   ├── registry.cpython-314.pyc
+│   │   │   ├── run.cpython-314.pyc
+│   │   │   └── status.cpython-314.pyc
+│   │   ├── README.md
+│   │   ├── registry.py
+│   │   ├── run.py
+│   │   └── status.py
+│   ├── ask.py
+│   ├── backends
+│   │   ├── api_gemini.py
+│   │   ├── api_openai.py
+│   │   ├── __init__.py
+│   │   ├── local_ollama.py
+│   │   └── __pycache__
+│   │       ├── api_gemini.cpython-311.pyc
+│   │       ├── api_gemini.cpython-314.pyc
+│   │       ├── api_openai.cpython-314.pyc
+│   │       ├── __init__.cpython-311.pyc
+│   │       ├── __init__.cpython-314.pyc
+│   │       ├── local_ollama.cpython-311.pyc
+│   │       └── local_ollama.cpython-314.pyc
+│   ├── bridge.py
+│   ├── cmd.py
+│   ├── common.py
+│   ├── core
+│   │   ├── config.py
+│   │   ├── exec.py
+│   │   ├── __init__.py
+│   │   ├── last_error.py
+│   │   ├── memory.py
+│   │   ├── paths.py
+│   │   ├── __pycache__
+│   │   │   ├── config.cpython-314.pyc
+│   │   │   ├── exec.cpython-314.pyc
+│   │   │   ├── __init__.cpython-314.pyc
+│   │   │   ├── last_error.cpython-314.pyc
+│   │   │   ├── memory.cpython-314.pyc
+│   │   │   ├── paths.cpython-314.pyc
+│   │   │   ├── routing.cpython-314.pyc
+│   │   │   ├── safety.cpython-314.pyc
+│   │   │   └── storage.cpython-314.pyc
+│   │   ├── routing.py
+│   │   ├── safety.py
+│   │   └── storage.py
+│   ├── __init__.py
+│   ├── __pycache__
+│   │   ├── ai.cpython-311.pyc
+│   │   ├── ai.cpython-314.pyc
+│   │   ├── ask.cpython-311.pyc
+│   │   ├── ask.cpython-314.pyc
+│   │   ├── bridge.cpython-311.pyc
+│   │   ├── bridge.cpython-314.pyc
+│   │   ├── cmd.cpython-311.pyc
+│   │   ├── cmd.cpython-314.pyc
+│   │   ├── common.cpython-311.pyc
+│   │   ├── common.cpython-314.pyc
+│   │   ├── __init__.cpython-311.pyc
+│   │   ├── __init__.cpython-314.pyc
+│   │   ├── status.cpython-311.pyc
+│   │   └── status.cpython-314.pyc
+│   └── ui
+│       ├── ansi.py
+│       ├── __init__.py
+│       ├── prompts.py
+│       └── __pycache__
+│           ├── ansi.cpython-311.pyc
+│           ├── ansi.cpython-314.pyc
+│           ├── __init__.cpython-311.pyc
+│           ├── __init__.cpython-314.pyc
+│           ├── prompts.cpython-311.pyc
+│           └── prompts.cpython-314.pyc
+├── ai-term
