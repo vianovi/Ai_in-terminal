@@ -1,47 +1,47 @@
 """
-AI-Term • MON (System Cockpit & Intelligence) — V5.0 GOLD
-
-Fokus utama V5:
-- Live Cockpit (dibuka tiap boot): header lebih jelas + grouping rapi (Task Manager-ish).
-- Live Net: ping HUD non-scrolling (alt-screen) + graph + loss/jitter.
+AI-Term • MON (System Cockpit & Intelligence) — V4.1
 
 Tujuan:
 - `ai mon live`    : HUD realtime yang clean, vertikal, dan informatif.
 - `ai mon sensors` : tampilkan SEMUA sensor/field yang bisa dibaca (psutil + sysfs + optional tools).
-- `ai mon batt`    : battery intel + history/time-travel (bisa pilih tanggal pembanding).
-- `ai mon disk`    : SMART + TBW/TBR + SSD health (NVMe) + history/time-travel.
+- `ai mon batt`    : laporan battery intel + history tracking.
+- `ai mon disk`    : laporan storage SMART/TBW + history tracking (tanpa memaksa sudo).
 - `ai mon net`     : network diagnostics (ping/dns + wifi detail).
-- `ai mon net live`: live ping graph (non-scrolling).
+- `ai mon net live`: live ping graph.
 
-V5.0 GOLD Update (ringkas):
-- LIVE COCKPIT:
-  - Header dirombak: Host/OS/Kernel/Run context dipisah & Load avg diberi label (1m/5m/15m).
-  - Load/CPU (normalized) ditambahkan agar lebih mudah dibaca.
-  - Fan label diperjelas: 0 RPM (OFF), Very Low/Low/Medium/High.
-- HISTORY (Battery + Disk):
-  - Default baseline: earliest snapshot dalam window 30 bulan (fallback ke terlama).
-  - Bisa `--list` lihat snapshot, `--pick` pilih tanggal, atau `--compare YYYY-MM-DD`.
-  - Disk: tambahan TBR (Total Bytes Read) jika device expose; NVMe: Wear Health dari Percentage Used.
-- NET LIVE:
-  - Render ulang: alt-screen non-scrolling + sparkline + loss/jitter/avg.
+V4.1 Update (baru):
+- LIVE: GPU utilization dihapus dari HUD (permission/akses iGPU tidak stabil) dan diganti CPU Freq/Speed.
+- Header dipoles: ada pemisah + warna, Load diperjelas jadi Load avg (1/5/15) + jumlah CPU.
+- TOP list dipisah dari bar CPU/RAM:
+  - Top CPU (1–3) dan Top MEM (1–3), throttled agar ringan.
+- Throttle indicator dirapihin:
+  - Line sendiri, delta-based (ACTIVE hanya jika counter naik pada interval).
+- Fan output dirapihin:
+  - "Idle/Low/Med/High (RPM)" atau "N/A".
+- Network dipecah 2 baris (NET + PING) supaya tidak melebar.
+- DISKS dirapihin jadi tabel aligned dengan separator '|':
+  - Kolom MOUNT digeser ke paling kanan.
+  - Trimming mountpoint aman agar tampilan tetap vertikal.
 
 Catatan desain:
 - Dependency utama: `psutil` (Wajib untuk monitoring).
   Install Fedora: sudo dnf install python3-psutil
 - Optional tools:
   sudo dnf install lm_sensors smartmontools pciutils iw iproute util-linux
+  (optional iGPU advanced): sudo dnf install intel-gpu-tools
 - History path: ai_logic.common.MON_HISTORY_PATH (fallback aman bila common belum update).
 - Tidak memakai rich (ANSI-only, konsisten dengan project).
-- Disk SMART: default tidak memaksa sudo (agar tidak memunculkan prompt password).
+- Tidak memunculkan ERROR yang bikin panik untuk kondisi wajar (mis. sensor tidak tersedia).
+- Disk SMART/TBW: default tidak memaksa sudo (agar tidak memunculkan prompt password).
   Untuk data lengkap: jalankan `sudo ai mon disk`.
 
 Subcommands:
   ai mon live [--interval N] [--compact] [--target HOST] [--iface IFACE] [--disk "LABEL=TARGET"] [--no-disks] [--maxwidth N]
   ai mon sensors
-  ai mon batt [--list|--history] [--pick] [--compare YYYY-MM-DD] [--window-months N]
-  ai mon disk [--sudo|--deep] [--list|--history] [--pick] [--compare YYYY-MM-DD] [--window-months N] [--only DEV]
+  ai mon batt
+  ai mon disk [--sudo|--deep]
   ai mon net [target]
-  ai mon net live [target] [--interval N] [--window N]
+  ai mon net live [target]
   ai mon help
 
 History file:
@@ -278,16 +278,9 @@ def _save_db(data: dict) -> None:
 def snapshot_metric(category: str, item_id: str, metric: str, value: float) -> bool:
     """
     Save First Check: simpan hanya jika hari ini belum ada.
-
     Return:
       True  -> snapshot tersimpan
       False -> sudah ada snapshot hari ini (skip)
-
-    Catatan:
-    - Format history file: JSON (append-only per hari).
-    - Skema saat ini:
-        { "<category>": { "<item_id>": { "<metric>": { "YYYY-MM-DD": <value>, ... }}}}
-      (Opsional) ada _meta.
     """
     db = _load_db()
     today = _dt.date.today().isoformat()
@@ -296,10 +289,6 @@ def snapshot_metric(category: str, item_id: str, metric: str, value: float) -> b
     db[category].setdefault(item_id, {})
     db[category][item_id].setdefault(metric, {})
 
-    # Guard: metric-series harus dict agar aman untuk versi lama/korup.
-    if not isinstance(db[category][item_id][metric], dict):
-        db[category][item_id][metric] = {}
-
     if today in db[category][item_id][metric]:
         return False
 
@@ -307,180 +296,9 @@ def snapshot_metric(category: str, item_id: str, metric: str, value: float) -> b
     _save_db(db)
     return True
 
-
-def _parse_iso_date(s: str) -> Optional[_dt.date]:
-    try:
-        return _dt.date.fromisoformat((s or "").strip())
-    except Exception:
-        return None
-
-
-def _days_in_month(year: int, month: int) -> int:
-    """Days in month (Gregorian)."""
-    try:
-        if month == 12:
-            nxt = _dt.date(year + 1, 1, 1)
-        else:
-            nxt = _dt.date(year, month + 1, 1)
-        return int((nxt - _dt.timedelta(days=1)).day)
-    except Exception:
-        return 30
-
-
-def _months_ago(d: _dt.date, months: int) -> _dt.date:
+def get_comparison_text(category: str, item_id: str, metric: str, current: float, unit: str = "") -> str:
     """
-    Subtract N months from date (clamps day).
-    Example: 2026-03-31 minus 1 month => 2026-02-28
-    """
-    m = int(max(0, months))
-    y = int(d.year)
-    mm = int(d.month) - m
-    while mm <= 0:
-        y -= 1
-        mm += 12
-    day = min(int(d.day), _days_in_month(y, mm))
-    return _dt.date(y, mm, day)
-
-
-def list_metric_dates(category: str, item_id: str, metric: str) -> list[str]:
-    """List available dates for a metric-series (sorted)."""
-    db = _load_db()
-    series = db.get(category, {}).get(item_id, {}).get(metric, {})
-    if not isinstance(series, dict):
-        return []
-    out: list[str] = []
-    for k in series.keys():
-        if not isinstance(k, str):
-            continue
-        if _parse_iso_date(k) is None:
-            continue
-        out.append(k)
-    return sorted(out)
-
-
-def get_metric_value(category: str, item_id: str, metric: str, date_iso: str) -> Optional[float]:
-    db = _load_db()
-    series = db.get(category, {}).get(item_id, {}).get(metric, {})
-    if not isinstance(series, dict):
-        return None
-    if date_iso not in series:
-        return None
-    try:
-        return float(series[date_iso])
-    except Exception:
-        return None
-
-
-def _nearest_date_on_or_before(dates: list[str], want_iso: str) -> Optional[str]:
-    """Return nearest date <= want_iso (iso) from dates list."""
-    w = _parse_iso_date(want_iso)
-    if w is None or not dates:
-        return None
-    best: Optional[str] = None
-    best_d: Optional[_dt.date] = None
-    for s in dates:
-        d = _parse_iso_date(s)
-        if d is None:
-            continue
-        if d <= w and (best_d is None or d > best_d):
-            best = s
-            best_d = d
-    return best
-
-
-def _select_baseline_date(dates: list[str], window_months: int = 30) -> Optional[str]:
-    """
-    Default baseline:
-    - Earliest date that is still within last <window_months> months.
-    - If no snapshot in that window, fallback to the oldest available.
-    """
-    if not dates:
-        return None
-    today = _dt.date.today()
-    wm = int(window_months) if isinstance(window_months, int) else 30
-    if wm > 0:
-        limit = _months_ago(today, wm)
-        in_window: list[str] = []
-        for s in dates:
-            d = _parse_iso_date(s)
-            if d is None:
-                continue
-            if d >= limit:
-                in_window.append(s)
-        if in_window:
-            return in_window[0]
-    return dates[0]
-
-
-def get_prev_date(category: str, item_id: str, metric: str) -> Optional[str]:
-    """
-    Previous snapshot date (best-effort).
-    If today's snapshot exists, returns the date right before it.
-    Otherwise, returns the newest date.
-    """
-    dates = list_metric_dates(category, item_id, metric)
-    if not dates:
-        return None
-    today = _dt.date.today().isoformat()
-    if dates[-1] == today:
-        return dates[-2] if len(dates) >= 2 else None
-    return dates[-1]
-
-
-def pick_date_interactive(dates: list[str], title: str = "Pilih tanggal") -> Optional[str]:
-    """
-    Interactive picker for ISO date list.
-    Returns ISO date string or None.
-    """
-    if not dates:
-        return None
-
-    print(f"\n{ansi.c_bold()}{title}{ansi.c_reset()}")
-    for i, d in enumerate(dates, start=1):
-        print(f"  {i:>2}. {d}")
-    print(f"  {ansi.c_dim()}0. Batal{ansi.c_reset()}")
-
-    try:
-        raw = input(f"{ansi.c_cyan()}Pilih nomor{ansi.c_reset()} (0-{len(dates)}): ").strip()
-    except KeyboardInterrupt:
-        print("")
-        return None
-
-    if not raw:
-        return None
-    if raw == "0":
-        return None
-    try:
-        idx = int(raw)
-        if 1 <= idx <= len(dates):
-            return dates[idx - 1]
-    except Exception:
-        return None
-    return None
-
-
-def get_comparison_text(
-    category: str,
-    item_id: str,
-    metric: str,
-    current: float,
-    unit: str = "",
-    ref_date: Optional[str] = None,
-    window_months: int = 30,
-) -> str:
-    """
-    Comparison string: current vs baseline.
-
-    Default:
-    - baseline is the earliest snapshot within last 30 months (configurable),
-      fallback to the oldest snapshot if the window is empty.
-
-    If ref_date is provided:
-    - use that exact date if exists
-    - else: fallback to nearest date <= ref_date
-    - else fallback to default baseline
-
-    Output includes [YYYY-MM-DD] tag for transparency.
+    Bandingkan current vs data terlama (agar “time travel” terasa).
     """
     db = _load_db()
     try:
@@ -488,33 +306,14 @@ def get_comparison_text(
         if not isinstance(series, dict) or not series:
             return ""
 
-        dates = list_metric_dates(category, item_id, metric)
-        if not dates:
-            return ""
-
-        today_iso = _dt.date.today().isoformat()
-        today_d = _dt.date.today()
-
-        chosen = None
-        if ref_date:
-            if ref_date in series:
-                chosen = ref_date
-            else:
-                chosen = _nearest_date_on_or_before(dates, ref_date)
-
-        if chosen is None:
-            chosen = _select_baseline_date(dates, window_months=window_months)
-
-        if chosen is None:
-            return ""
-
-        if chosen == today_iso:
+        dates = sorted(series.keys())
+        oldest = dates[0]
+        if oldest == _dt.date.today().isoformat():
             return f"{ansi.c_dim()}(mulai tracking hari ini){ansi.c_reset()}"
 
-        old_val = float(series[chosen])
+        old_val = float(series[oldest])
         diff = float(current) - old_val
-        ref_d = _parse_iso_date(chosen)
-        days = (today_d - ref_d).days if ref_d else 0
+        days = (_dt.date.today() - _dt.date.fromisoformat(oldest)).days
 
         icon = "⚪"
         if diff > 0:
@@ -522,12 +321,10 @@ def get_comparison_text(
         elif diff < 0:
             icon = "📉"
 
-        # display date to avoid ambiguity
-        date_tag = f"{ansi.c_dim()}[{chosen}]{ansi.c_reset()}"
-
-        return f"{ansi.c_dim()}vs {days} hari lalu {date_tag}: {old_val:.2f} -> {current:.2f} ({icon}{diff:+.2f}{unit}){ansi.c_reset()}"
+        return f"{ansi.c_dim()}vs {days} hari lalu: {old_val:.2f} -> {current:.2f} ({icon}{diff:+.2f}{unit}){ansi.c_reset()}"
     except Exception:
         return ""
+
 
 # ==========================================================
 # 2) SENSOR PROBES (psutil + sysfs + optional tools)
@@ -1384,54 +1181,8 @@ def run_sensors_dump() -> int:
     return 0
 
 
-def run_battery_check(argv: list[str]) -> int:
-    """
-    Battery report + history.
-
-    Usage:
-      ai mon batt [--list|--history] [--pick] [--compare YYYY-MM-DD] [--window-months N]
-
-    Default comparison:
-      baseline = earliest snapshot within last 30 months (fallback to oldest overall).
-      also prints prev snapshot delta if available.
-    """
+def run_battery_check() -> int:
     ansi.print_system("BATTERY INTELLIGENCE (HISTORY + HEALTH)")
-
-    window_months = 30
-    ref_date: Optional[str] = None
-    want_list = False
-    want_pick = False
-
-    i = 0
-    while i < len(argv):
-        a = (argv[i] or "").strip()
-        if not a:
-            i += 1
-            continue
-        if a in ("-h", "--help", "help"):
-            ansi.print_info("ai mon batt")
-            print("  ai mon batt [--list|--history] [--pick] [--compare YYYY-MM-DD] [--window-months N]")
-            print("")
-            print("Options:")
-            print("  --list / --history     : tampilkan list snapshot yang tersimpan")
-            print("  --pick                 : pilih tanggal pembanding secara interaktif")
-            print("  --compare YYYY-MM-DD   : bandingkan dengan tanggal tertentu (fallback ke tanggal terdekat <=)")
-            print("  --window-months N      : batas baseline default (bulan), default 30")
-            return 0
-        if a in ("--list", "--history", "list", "history"):
-            want_list = True
-        elif a == "--pick":
-            want_pick = True
-        elif a == "--compare" and i + 1 < len(argv):
-            ref_date = (argv[i + 1] or "").strip() or None
-            i += 1
-        elif a == "--window-months" and i + 1 < len(argv):
-            try:
-                window_months = int(float(argv[i + 1]))
-            except Exception:
-                window_months = 30
-            i += 1
-        i += 1
 
     pr = PowerReader()
     cap = pr.read_capacity_health()
@@ -1442,12 +1193,8 @@ def run_battery_check(argv: list[str]) -> int:
         return 0
 
     model = cap.get("model") or live.get("batt_name") or "BAT"
-    model_id = str(model)
+    print(f"\n{ansi.tag(str(model), ansi.c_cyan())}")
 
-    print(f"\n{ansi.tag(model_id, ansi.c_cyan())}")
-
-    # --- MAIN HEALTH SUMMARY ---
-    snap_saved = False
     if cap.get("ok"):
         health = float(cap["health_pct"])
         full = float(cap["full"])
@@ -1459,52 +1206,20 @@ def run_battery_check(argv: list[str]) -> int:
         print(f"  Health        : {col}{health:.2f}%{ansi.c_reset()}  {ansi.c_dim()}(usable vs design){ansi.c_reset()}")
         print(f"  Capacity      : {full:.2f}/{design:.2f} {unit}   Cycles: {cyc}")
 
-        s1 = snapshot_metric("battery", model_id, "health_pct", round(health, 2))
-        s2 = snapshot_metric("battery", model_id, "capacity_full", round(full, 2))
-        snap_saved = bool(s1 or s2)
+        s1 = snapshot_metric("battery", str(model), "health_pct", round(health, 2))
+        s2 = snapshot_metric("battery", str(model), "capacity_full", round(full, 2))
 
-        # --- PICK DATE (interactive) ---
-        if want_pick and not ref_date:
-            dates = sorted(set(
-                list_metric_dates("battery", model_id, "health_pct")
-                + list_metric_dates("battery", model_id, "capacity_full")
-            ))
-            picked = pick_date_interactive(dates, title="Pilih snapshot pembanding (battery)")
-            ref_date = picked or None
+        c1 = get_comparison_text("battery", str(model), "health_pct", round(health, 2), "%")
+        c2 = get_comparison_text("battery", str(model), "capacity_full", round(full, 2), unit)
 
-        # --- TIME TRAVEL ---
         print(f"  {ansi.c_bold()}[ TIME TRAVEL ]{ansi.c_reset()}")
-
-        base_h = get_comparison_text("battery", model_id, "health_pct", round(health, 2), "%", ref_date=ref_date, window_months=window_months)
-        base_c = get_comparison_text("battery", model_id, "capacity_full", round(full, 2), unit, ref_date=ref_date, window_months=window_months)
-
-        prev_h_date = get_prev_date("battery", model_id, "health_pct")
-        prev_c_date = get_prev_date("battery", model_id, "capacity_full")
-
-        prev_h = get_comparison_text("battery", model_id, "health_pct", round(health, 2), "%", ref_date=prev_h_date, window_months=0) if prev_h_date else ""
-        prev_c = get_comparison_text("battery", model_id, "capacity_full", round(full, 2), unit, ref_date=prev_c_date, window_months=0) if prev_c_date else ""
-
-        print(f"  • Health (base): {base_h if base_h else '-'}")
-        if prev_h and (prev_h_date != ref_date):
-            print(f"  • Health (prev): {prev_h}")
-        print(f"  • Capacity     : {base_c if base_c else '-'}")
-        if prev_c and (prev_c_date != ref_date):
-            print(f"  • Capacity(prev): {prev_c}")
-
-        # --- TRACKING STATS ---
-        dates_h = list_metric_dates("battery", model_id, "health_pct")
-        if dates_h:
-            first = dates_h[0]
-            last = dates_h[-1]
-            print(f"  {ansi.c_dim()}Tracking: {len(dates_h)} snapshots ({first} -> {last}){ansi.c_reset()}")
-
-        if snap_saved:
+        print(f"  • Health      : {c1 if c1 else '-'}")
+        print(f"  • Capacity    : {c2 if c2 else '-'}")
+        if s1 or s2:
             print(f"    {ansi.c_dim()}✓ Snapshot hari ini disimpan.{ansi.c_reset()}")
-
     else:
         print(f"  {ansi.c_yellow()}Info:{ansi.c_reset()} kapasitas/design tidak tersedia di sysfs, hanya tampilkan live-power.")
 
-    # --- LIVE POWER ---
     if live.get("ok"):
         pct = live.get("percent")
         st = str(live.get("status_raw") or "Unknown")
@@ -1516,40 +1231,6 @@ def run_battery_check(argv: list[str]) -> int:
         print(f"\n  {ansi.c_bold()}[ LIVE POWER ]{ansi.c_reset()}")
         print(f"  Level         : {pct_txt}   Status: {st}")
         print(f"  Flow          : {ansi.c_yellow()}{w}{ansi.c_reset()} @ {v} | {a}")
-
-    # --- HISTORY LIST ---
-    if want_list and cap.get("ok"):
-        health = float(cap["health_pct"])
-        full = float(cap["full"])
-        unit = str(cap["unit"])
-
-        print(f"\n{ansi.c_bold()}[ HISTORY LIST ]{ansi.c_reset()} {ansi.c_dim()}(battery){ansi.c_reset()}")
-        dates = sorted(set(
-            list_metric_dates("battery", model_id, "health_pct")
-            + list_metric_dates("battery", model_id, "capacity_full")
-        ))
-        if not dates:
-            print(f"  {ansi.c_dim()}(no snapshots yet){ansi.c_reset()}")
-            return 0
-
-        # Print last N rows
-        MAX = 60
-        show = dates[-MAX:] if len(dates) > MAX else dates
-
-        print(f"  {ansi.c_dim()}{'DATE':<12} | {'HEALTH%':>7} | {'CAPACITY':>12}{ansi.c_reset()}")
-        print(f"  {ansi.c_dim()}{'-'*12}-+-{'-'*7}-+-{'-'*12}{ansi.c_reset()}")
-        for d in show:
-            hv = get_metric_value("battery", model_id, "health_pct", d)
-            cv = get_metric_value("battery", model_id, "capacity_full", d)
-            hv_s = f"{hv:>6.2f}" if isinstance(hv, (int, float)) else "   -  "
-            cv_s = f"{cv:>10.2f}" if isinstance(cv, (int, float)) else "    -     "
-            print(f"  {d:<12} | {hv_s:>7} | {cv_s:>10} {unit}")
-
-        if len(dates) > MAX:
-            print(f"  {ansi.c_dim()}...(showing last {MAX} of {len(dates)}){ansi.c_reset()}")
-
-        print(f"\n  {ansi.c_dim()}Tip:{ansi.c_reset()} `ai mon batt --pick` untuk bandingkan ke tanggal tertentu.")
-        print(f"  {ansi.c_dim()}Tip:{ansi.c_reset()} file history: {MON_HISTORY_PATH}")
 
     return 0
 
@@ -1582,251 +1263,94 @@ def _lsblk_disks() -> list[dict[str, str]]:
         return []
 
 def _parse_smart_health(smart_a: str, smart_h: str) -> dict[str, Any]:
-    """
-    Parse smartctl output (best-effort, vendor-agnostic).
-
-    Returns dict keys (superset; some may be None):
-      - health_text (str)
-      - health_color (ansi color)
-      - health_pct (float|None)      # NVMe Percentage Used -> health
-      - temp_c (float|None)
-      - temp_str (str)
-      - power_on (str)
-      - tbw_gb (float|None)
-      - tbr_gb (float|None)
-      - has_tbw (bool)
-      - has_tbr (bool)
-
-    Notes:
-    - NVMe: "Percentage Used" + "Data Units Written/Read"
-    - SATA: may expose Total_LBAs_Written/Read or attribute tables.
-    """
     out: dict[str, Any] = {
-        "health_text": "Unknown",
+        "health": "Unknown",
         "health_color": ansi.c_dim(),
-        "health_pct": None,
-        "temp_c": None,
-        "temp_str": "N/A",
+        "temp": "N/A",
         "power_on": "N/A",
-        "tbw_gb": None,
-        "tbr_gb": None,
-        "has_tbw": False,
-        "has_tbr": False,
+        "writes_gb": None,
+        "has_writes": False,
     }
 
-    def _to_float(x: str) -> Optional[float]:
-        try:
-            return float(str(x).replace(",", "").strip())
-        except Exception:
-            return None
-
-    def _bracket_gb(raw: str) -> Optional[float]:
-        """
-        Parse bracket payload like "12.3 TB" or "1234 GB" -> GB float.
-        """
-        s = (raw or "").strip()
-        if not s:
-            return None
-        parts = s.replace(",", "").split()
-        if len(parts) < 2:
-            return None
-        num = _to_float(parts[0])
-        unit = parts[1].upper()
-        if num is None:
-            return None
-        if unit.startswith("TB"):
-            return float(num) * 1024.0
-        if unit.startswith("GB"):
-            return float(num)
-        if unit.startswith("MB"):
-            return float(num) / 1024.0
-        return None
-
-    # smartctl -A
-    for ln in (smart_a or "").splitlines():
-        s = ln.strip()
-
-        # NVMe wear
-        if "Percentage Used" in s:
+    for ln in smart_a.splitlines():
+        if "Percentage Used" in ln:
             try:
-                used = int(s.split(":")[-1].replace("%", "").strip())
-                health = 100 - used
-                out["health_pct"] = float(health)
-                out["health_text"] = f"{health}%"
-                out["health_color"] = ansi.c_green() if health >= 80 else (ansi.c_yellow() if health >= 60 else ansi.c_red())
+                used = int(ln.split(":")[-1].replace("%", "").strip())
+                h = 100 - used
+                out["health"] = f"{h}%"
+                out["health_color"] = ansi.c_green() if h >= 80 else ansi.c_yellow()
             except Exception:
                 pass
 
-        # Temperature (NVMe style)
-        if s.startswith("Temperature:") and "Celsius" in s:
-            # Example: Temperature:                        33 Celsius
+        if "Temperature:" in ln and "Celsius" in ln:
             try:
-                toks = s.split()
-                # last numeric before "Celsius"
-                num = None
-                for tok in toks:
-                    if tok.lstrip("-").isdigit():
-                        num = tok
-                if num is not None:
-                    out["temp_c"] = float(num)
-                    out["temp_str"] = f"{int(float(num))}°C"
+                t = ln.split("Temperature:", 1)[1].replace("Celsius", "").strip()
+                out["temp"] = t.replace(" ", "") + "°C"
             except Exception:
                 pass
 
-        # Generic temperature (table)
-        if ("Temperature" in s or "Celsius" in s) and ("Airflow" not in s):
-            # Attempt last token number
+        if ("Temperature" in ln or "Celsius" in ln) and ("Airflow" not in ln):
             try:
-                toks = s.split()
+                toks = ln.split()
                 if toks and toks[-1].lstrip("-").isdigit():
-                    out["temp_c"] = float(toks[-1])
-                    out["temp_str"] = f"{int(float(toks[-1]))}°C"
+                    out["temp"] = toks[-1] + "°C"
             except Exception:
                 pass
 
-        # Power on hours
-        if "Power On Hours" in s or "Power_On_Hours" in s:
+        if "Power On Hours" in ln or "Power_On_Hours" in ln:
             try:
-                out["power_on"] = s.split(":")[-1].strip() if ":" in s else s.split()[-1].strip()
+                out["power_on"] = ln.split(":")[-1].strip() if ":" in ln else ln.split()[-1].strip()
             except Exception:
                 pass
 
-        # NVMe: Data Units Written / Read (bracket has human unit)
-        if "Data Units Written" in s and "[" in s and "]" in s:
+        if "Data Units Written" in ln and "[" in ln and "]" in ln:
             try:
-                br = s.split("[", 1)[1].split("]", 1)[0].strip()
-                gb = _bracket_gb(br)
+                raw = ln.split("[", 1)[1].split("]", 1)[0].strip()
+                num_s, unit = raw.split()[:2]
+                num = float(num_s)
+                gb = num * 1024.0 if "TB" in unit.upper() else (num if "GB" in unit.upper() else None)
                 if gb is not None:
-                    out["tbw_gb"] = float(gb)
-                    out["has_tbw"] = True
+                    out["writes_gb"] = float(gb)
+                    out["has_writes"] = True
             except Exception:
                 pass
 
-        if "Data Units Read" in s and "[" in s and "]" in s:
+        if "Total_LBAs_Written" in ln:
             try:
-                br = s.split("[", 1)[1].split("]", 1)[0].strip()
-                gb = _bracket_gb(br)
-                if gb is not None:
-                    out["tbr_gb"] = float(gb)
-                    out["has_tbr"] = True
-            except Exception:
-                pass
-
-        # SATA-like
-        if "Total_LBAs_Written" in s:
-            try:
-                lba = int(s.split()[-1].replace(",", ""))
+                lba = int(ln.split()[-1])
                 gb = (lba * 512.0) / (1024.0**3)
-                out["tbw_gb"] = float(gb)
-                out["has_tbw"] = True
+                out["writes_gb"] = float(gb)
+                out["has_writes"] = True
             except Exception:
                 pass
 
-        if "Total_LBAs_Read" in s:
-            try:
-                lba = int(s.split()[-1].replace(",", ""))
-                gb = (lba * 512.0) / (1024.0**3)
-                out["tbr_gb"] = float(gb)
-                out["has_tbr"] = True
-            except Exception:
-                pass
-
-    # smartctl -H (overall)
-    if out["health_text"] == "Unknown":
-        if "PASSED" in (smart_h or ""):
-            out["health_text"] = "PASSED"
+    if out["health"] == "Unknown":
+        if "PASSED" in smart_h:
+            out["health"] = "PASSED"
             out["health_color"] = ansi.c_green()
-        elif "FAILED" in (smart_h or ""):
-            out["health_text"] = "FAILED"
+        elif "FAILED" in smart_h:
+            out["health"] = "FAILED"
             out["health_color"] = ansi.c_red()
 
     return out
 
-
 def run_disk_check(argv: list[str]) -> int:
-    """
-    Storage SMART/TBW/TBR + history.
-
-    Usage:
-      ai mon disk [--sudo|--deep] [--list|--history] [--pick] [--compare YYYY-MM-DD] [--window-months N] [--only DEV]
-
-    Notes:
-    - Default doesn't force sudo (to avoid password prompt).
-    - If you want full metrics: `sudo ai mon disk`
-    - History saves once/day per disk metric.
-    """
     ansi.print_system("STORAGE HEALTH (INTELLIGENT MODE)")
 
     if not shutil.which("smartctl"):
         ansi.print_brief_error("Butuh 'smartmontools'. Install: sudo dnf install smartmontools")
         return 1
 
-    window_months = 30
-    ref_date: Optional[str] = None
-    want_list = False
-    want_pick = False
-    only_dev: Optional[str] = None
-
-    # Keep legacy sudo switch behavior
-    want_sudo = (os.geteuid() == 0) or any(a in argv for a in ("--sudo", "sudo", "--deep", "deep"))
-
-    # Parse options
-    i = 0
-    while i < len(argv):
-        a = (argv[i] or "").strip()
-        if not a:
-            i += 1
-            continue
-        if a in ("-h", "--help", "help"):
-            ansi.print_info("ai mon disk")
-            print("  ai mon disk [--sudo|--deep] [--list|--history] [--pick] [--compare YYYY-MM-DD] [--window-months N] [--only DEV]")
-            print("")
-            print("Options:")
-            print("  --sudo / --deep         : jalankan smartctl dengan sudo jika dibutuhkan")
-            print("  --list / --history      : tampilkan list snapshot history")
-            print("  --pick                  : pilih tanggal pembanding (interaktif)")
-            print("  --compare YYYY-MM-DD    : bandingkan dengan tanggal tertentu (fallback ke terdekat <=)")
-            print("  --window-months N       : baseline default window (bulan), default 30")
-            print("  --only DEV              : hanya cek satu disk (contoh: nvme0n1, sda)")
-            return 0
-
-        if a in ("--list", "--history", "list", "history"):
-            want_list = True
-        elif a == "--pick":
-            want_pick = True
-        elif a == "--compare" and i + 1 < len(argv):
-            ref_date = (argv[i + 1] or "").strip() or None
-            i += 1
-        elif a == "--window-months" and i + 1 < len(argv):
-            try:
-                window_months = int(float(argv[i + 1]))
-            except Exception:
-                window_months = 30
-            i += 1
-        elif a == "--only" and i + 1 < len(argv):
-            only_dev = (argv[i + 1] or "").strip() or None
-            i += 1
-        i += 1
-
     disks = _lsblk_disks()
-    if only_dev:
-        disks = [d for d in disks if (d.get("name") or "").strip() == only_dev]
-
     if not disks:
         print("Tidak ada disk fisik yang terdeteksi.")
         return 0
 
-    if not want_sudo and os.geteuid() != 0:
-        print(f"{ansi.c_yellow()}Info:{ansi.c_reset()} beberapa metrik (TBW/TBR/detail health) mungkin butuh sudo.")
-        print(f"  Jalankan: {ansi.c_cyan()}sudo ai mon disk{ansi.c_reset()}  (untuk data lengkap)")
+    want_sudo = (os.geteuid() == 0) or any(a in argv for a in ("--sudo", "sudo", "--deep", "deep"))
 
-    # pick date once (global) based on first disk tbw series (best-effort)
-    if want_pick and not ref_date:
-        d0 = disks[0]
-        name0 = d0.get("name", "")
-        # We don't have uniq yet; try with a simple id. If missing, user can --compare.
-        # We'll do interactive pick later per disk if needed.
-        print(f"{ansi.c_dim()}(pick mode) akan menawarkan tanggal per disk saat proses berjalan.{ansi.c_reset()}")
+    if not want_sudo and os.geteuid() != 0:
+        print(f"{ansi.c_yellow()}Info:{ansi.c_reset()} beberapa metrik (TBW/health detail) mungkin butuh sudo.")
+        print(f"  Jalankan: {ansi.c_cyan()}sudo ai mon disk{ansi.c_reset()}  (untuk data lengkap)")
 
     for d in disks:
         name = d.get("name", "?")
@@ -1840,17 +1364,13 @@ def run_disk_check(argv: list[str]) -> int:
 
         cmdA = f"smartctl -A {dev}"
         cmdH = f"smartctl -H {dev}"
-        cmdI = f"smartctl -i {dev}"
+        codeA, outA = _sh(cmdA, timeout=6)
+        codeH, outH = _sh(cmdH, timeout=6)
 
-        codeA, outA = _sh(cmdA, timeout=8)
-        codeH, outH = _sh(cmdH, timeout=8)
-        codeI, outI = _sh(cmdI, timeout=6)
-
-        need_priv = ("permission denied" in (outA or "").lower()) or ("requires root" in (outA or "").lower()) or (codeA != 0 and not outA)
+        need_priv = ("permission denied" in outA.lower()) or ("requires root" in outA.lower()) or (codeA != 0 and not outA)
         if need_priv and want_sudo and os.geteuid() != 0:
-            codeA, outA = _sh(f"sudo {cmdA}", timeout=12)
-            codeH, outH = _sh(f"sudo {cmdH}", timeout=12)
-            codeI, outI = _sh(f"sudo {cmdI}", timeout=10)
+            codeA, outA = _sh(f"sudo {cmdA}", timeout=10)
+            codeH, outH = _sh(f"sudo {cmdH}", timeout=10)
 
         if not outA and not outH:
             print(f"  Health        : {ansi.c_yellow()}N/A ⚠{ansi.c_reset()}  {ansi.c_dim()}(smartctl tidak memberi output){ansi.c_reset()}")
@@ -1858,120 +1378,24 @@ def run_disk_check(argv: list[str]) -> int:
 
         parsed = _parse_smart_health(outA, outH)
 
-        # Stable-ish history id: name + model (sanitized), optionally serial
-        serial = ""
-        if outI:
-            for ln in outI.splitlines():
-                if "Serial Number" in ln:
-                    serial = ln.split(":", 1)[-1].strip()
-                    break
-        id_seed = serial or model or name
-        safe_seed = re.sub(r"[^A-Za-z0-9._-]+", "_", id_seed).strip("_")[:60]
-        uniq = f"{name}_{safe_seed}" if safe_seed else name
-
         hc = parsed["health_color"]
-        print(f"  Health        : {hc}{parsed['health_text']}{ansi.c_reset()}")
-        print(f"  Temperature   : {parsed.get('temp_str') or 'N/A'}")
-        print(f"  Power On      : {parsed.get('power_on') or 'N/A'}")
+        print(f"  Health        : {hc}{parsed['health']}{ansi.c_reset()}")
+        print(f"  Temperature   : {parsed['temp']}")
+        print(f"  Power On      : {parsed['power_on']}")
 
-        # TBW / TBR
-        tbw = parsed.get("tbw_gb") if parsed.get("has_tbw") else None
-        tbr = parsed.get("tbr_gb") if parsed.get("has_tbr") else None
-        hpct = parsed.get("health_pct") if isinstance(parsed.get("health_pct"), (int, float)) else None
+        if parsed["has_writes"] and parsed["writes_gb"] is not None:
+            gb = float(parsed["writes_gb"])
+            print(f"  Total Written : {gb:.2f} GB")
 
-        if isinstance(tbw, (int, float)):
-            print(f"  Total Written : {float(tbw):.2f} GB")
+            uniq = f"{name}_{model.replace(' ', '_')}"
+            did = snapshot_metric("disk", uniq, "tbw_gb", round(gb, 2))
+            diff = get_comparison_text("disk", uniq, "tbw_gb", round(gb, 2), "GB")
+
+            print(f"  {ansi.c_bold()}[ HISTORY ]{ansi.c_reset()} {diff if diff else '-'}")
+            if did:
+                print(f"    {ansi.c_dim()}✓ Snapshot hari ini disimpan.{ansi.c_reset()}")
         else:
-            print(f"  Total Written : {ansi.c_dim()}N/A{ansi.c_reset()}  {ansi.c_dim()}(butuh sudo / device tidak expose){ansi.c_reset()}")
-
-        if isinstance(tbr, (int, float)):
-            print(f"  Total Read    : {float(tbr):.2f} GB")
-        else:
-            print(f"  Total Read    : {ansi.c_dim()}N/A{ansi.c_reset()}  {ansi.c_dim()}(optional / device tidak expose){ansi.c_reset()}")
-
-        if isinstance(hpct, (int, float)):
-            col = ansi.c_green() if hpct >= 80 else (ansi.c_yellow() if hpct >= 60 else ansi.c_red())
-            print(f"  Wear Health   : {col}{float(hpct):.2f}%{ansi.c_reset()}  {ansi.c_dim()}(NVMe %Used){ansi.c_reset()}")
-
-        # Save history snapshots (once/day)
-        saved_any = False
-        if isinstance(tbw, (int, float)):
-            if snapshot_metric("disk", uniq, "tbw_gb", round(float(tbw), 2)):
-                saved_any = True
-        if isinstance(tbr, (int, float)):
-            if snapshot_metric("disk", uniq, "tbr_gb", round(float(tbr), 2)):
-                saved_any = True
-        if isinstance(hpct, (int, float)):
-            if snapshot_metric("disk", uniq, "health_pct", round(float(hpct), 2)):
-                saved_any = True
-
-        # Pick baseline date per disk if requested
-        disk_ref = ref_date
-        if want_pick and not disk_ref:
-            # Prefer tbw dates, else tbr, else health
-            cand = (
-                list_metric_dates("disk", uniq, "tbw_gb")
-                + list_metric_dates("disk", uniq, "tbr_gb")
-                + list_metric_dates("disk", uniq, "health_pct")
-            )
-            cand = sorted(set(cand))
-            disk_ref = pick_date_interactive(cand, title=f"Pilih snapshot pembanding untuk disk {name}") if cand else None
-
-        # HISTORY compare lines
-        def _cmp(metric: str, cur: float, unit: str) -> tuple[str, str]:
-            base = get_comparison_text("disk", uniq, metric, cur, unit, ref_date=disk_ref, window_months=window_months)
-            prev_d = get_prev_date("disk", uniq, metric)
-            prev = get_comparison_text("disk", uniq, metric, cur, unit, ref_date=prev_d, window_months=0) if prev_d else ""
-            return base, prev
-
-        print(f"  {ansi.c_bold()}[ HISTORY ]{ansi.c_reset()}")
-        any_hist = False
-
-        if isinstance(tbw, (int, float)):
-            base, prev = _cmp("tbw_gb", round(float(tbw), 2), "GB")
-            print(f"  • TBW         : {base if base else '-'}")
-            if prev and (disk_ref != get_prev_date("disk", uniq, "tbw_gb")):
-                print(f"    prev        : {prev}")
-            any_hist = True
-
-        if isinstance(tbr, (int, float)):
-            base, prev = _cmp("tbr_gb", round(float(tbr), 2), "GB")
-            print(f"  • TBR         : {base if base else '-'}")
-            if prev and (disk_ref != get_prev_date("disk", uniq, "tbr_gb")):
-                print(f"    prev        : {prev}")
-            any_hist = True
-
-        if isinstance(hpct, (int, float)):
-            base, prev = _cmp("health_pct", round(float(hpct), 2), "%")
-            print(f"  • Health      : {base if base else '-'}")
-            if prev and (disk_ref != get_prev_date("disk", uniq, "health_pct")):
-                print(f"    prev        : {prev}")
-            any_hist = True
-
-        if not any_hist:
-            print(f"  {ansi.c_dim()}(no numeric metrics to track yet){ansi.c_reset()}")
-
-        if saved_any:
-            print(f"    {ansi.c_dim()}✓ Snapshot hari ini disimpan.{ansi.c_reset()}")
-
-        if want_list:
-            print(f"\n  {ansi.c_bold()}[ HISTORY LIST ]{ansi.c_reset()} {ansi.c_dim()}({uniq}){ansi.c_reset()}")
-            for metric, unit in (("tbw_gb", "GB"), ("tbr_gb", "GB"), ("health_pct", "%")):
-                dates = list_metric_dates("disk", uniq, metric)
-                if not dates:
-                    continue
-                MAX = 30
-                show = dates[-MAX:] if len(dates) > MAX else dates
-                print(f"  {ansi.c_dim()}{metric}{ansi.c_reset()} ({unit})  {ansi.c_dim()}[{len(dates)} snapshots]{ansi.c_reset()}")
-                for dd in show:
-                    vv = get_metric_value("disk", uniq, metric, dd)
-                    if isinstance(vv, (int, float)):
-                        print(f"    - {dd}: {vv:.2f}{unit}")
-                if len(dates) > MAX:
-                    print(f"    {ansi.c_dim()}...(showing last {MAX}){ansi.c_reset()}")
-
-    if want_list:
-        print(f"\n{ansi.c_dim()}History file:{ansi.c_reset()} {MON_HISTORY_PATH}")
+            print(f"  Total Written : {ansi.c_dim()}N/A{ansi.c_reset()}  {ansi.c_dim()}(butuh sudo / device tidak expose metrik){ansi.c_reset()}")
 
     return 0
 
@@ -2100,161 +1524,41 @@ def run_net_diag(argv: list[str]) -> int:
 
 
 def run_net_live(argv: list[str]) -> int:
-    """
-    Live ping HUD (alt-screen, non-scrolling).
-
-    Usage:
-      ai mon net live [target] [--interval N] [--window N]
-
-    Notes:
-    - interval default: 0.8s
-    - window default: 48 samples
-    - shows avg/jitter/loss (based on the visible window)
-    """
-    if not shutil.which("ping"):
-        ansi.print_brief_error("Butuh command 'ping' (iputils).")
-        return 1
-
-    # Parse args
-    target = "google.com"
-    interval = 0.8
-    window = 48
-
-    i = 0
-    while i < len(argv):
-        a = (argv[i] or "").strip()
-        if not a:
-            i += 1
-            continue
-        if a in ("-h", "--help", "help"):
-            ansi.print_info("ai mon net live")
-            print("  ai mon net live [target] [--interval N] [--window N]")
-            print("")
-            print("Options:")
-            print("  --interval N   : interval ping (seconds), default 0.8")
-            print("  --window N     : jumlah sample di grafik, default 48")
-            return 0
-        if a == "--interval" and i + 1 < len(argv):
-            try:
-                interval = float(argv[i + 1])
-            except Exception:
-                pass
-            i += 2
-            continue
-        if a == "--window" and i + 1 < len(argv):
-            try:
-                window = int(float(argv[i + 1]))
-            except Exception:
-                pass
-            i += 2
-            continue
-        if a.startswith("--"):
-            # unknown option -> ignore
-            i += 1
-            continue
-        # positional: target
-        if target == "google.com":
-            target = a
-        i += 1
-
-    target = _pick_default_target(target)
-    interval = float(_clamp(interval, 0.2, 5.0))
-    window = int(_clamp(float(window), 10.0, 200.0))
-
-    # render helpers
-    blocks = "▁▂▃▄▅▆▇█" if ansi.supports_unicode() else "......."
-    max_ms = 200.0  # scale target for graph
-
-    def _spark(ms: Optional[float]) -> str:
-        if ms is None:
-            return f"{ansi.c_red()}×{ansi.c_reset()}" if ansi.supports_unicode() else f"{ansi.c_red()}x{ansi.c_reset()}"
-        try:
-            idx = int(_clamp((float(ms) / max_ms) * (len(blocks) - 1), 0.0, float(len(blocks) - 1)))
-        except Exception:
-            idx = 0
-        ch = blocks[idx]
-        if ms <= 50:
-            col = ansi.c_green()
-        elif ms <= 150:
-            col = ansi.c_yellow()
-        else:
-            col = ansi.c_red()
-        return f"{col}{ch}{ansi.c_reset()}"
-
-    def _fmt_ms(ms: Optional[float]) -> str:
-        if ms is None:
-            return f"{ansi.c_red()}TO{ansi.c_reset()}"
-        col = ansi.c_green() if ms <= 50 else (ansi.c_yellow() if ms <= 150 else ansi.c_red())
-        return f"{col}{ms:.0f}ms{ansi.c_reset()}"
-
-    samples: deque[Optional[float]] = deque(maxlen=window)
-
+    target = _pick_default_target(argv[0] if argv else "google.com")
     input_muter = ansi.MuteInputDuringWait()
+
     ansi.alt_screen_enter()
     ansi.cursor_hide()
     try:
+        print(f"{ansi.c_bold()}{ansi.c_cyan()} REALTIME NET MONITOR {ansi.c_reset()} -> {target}")
+        print(f"{ansi.c_dim()}Ctrl+C untuk keluar.{ansi.c_reset()}")
+        print(f"{'TIME':<10} {'LAT':<10} GRAPH")
+        print("-" * 60)
+
         with input_muter:
             while True:
                 ts = _dt.datetime.now().strftime("%H:%M:%S")
                 code, out = _sh(f"ping -c 1 -W 1 {target}", timeout=2)
-
-                ms: Optional[float] = None
+                ms = None
                 if out and "time=" in out:
                     try:
                         ms = float(out.split("time=", 1)[1].split()[0])
                     except Exception:
                         ms = None
 
-                samples.append(ms)
-
-                # Stats
-                vals = [v for v in samples if isinstance(v, (int, float))]
-                sent = len(samples)
-                recv = len(vals)
-                loss = (1.0 - (recv / sent)) * 100.0 if sent > 0 else 100.0
-                avg = (sum(vals) / len(vals)) if vals else None
-                jit = (max(vals) - min(vals)) if len(vals) >= 3 else None
-
-                # Render
-                ansi.clear_screen()
-                cols, _rows = ansi.term_size()
-                usable = min(cols, 96)
-
-                title_left = f"{ansi.c_cyan()}{ansi.c_bold()}AI MON{ansi.c_reset()} {ansi.c_dim()}• NET LIVE{ansi.c_reset()}"
-                title_right = f"{ansi.c_dim()}{target}{ansi.c_reset()}"
-                print(_align_lr(title_left, title_right, usable))
-                print(f"{ansi.c_dim()}{ansi.hr(usable)}{ansi.c_reset()}")
-
-                line1 = f"Time: {ts}   Last: {_fmt_ms(ms)}"
-                line2 = (
-                    f"Avg: {(_fmt_ms(avg) if avg is not None else (ansi.c_dim() + '-' + ansi.c_reset()))}   "
-                    f"Jitter: {(_fmt_ms(jit) if jit is not None else (ansi.c_dim() + '-' + ansi.c_reset()))}   "
-                    f"Loss: {ansi.c_yellow()}{loss:.0f}%{ansi.c_reset()}   "
-                    f"Window: {sent}"
-                )
-                print(line1)
-                print(line2)
-                print(f"{ansi.c_dim()}{ansi.hr(usable)}{ansi.c_reset()}")
-
-                # Graph (single line, newest at right)
-                graph = "".join(_spark(v) for v in samples)
-                if ansi.supports_unicode():
-                    legend = f"{ansi.c_dim()}Legend: ▁..█ ≈ 0..{int(max_ms)}ms, × timeout{ansi.c_reset()}"
+                if ms is None:
+                    print(f"{ts:<10} {'TO':<10} {ansi.c_red()}X{ansi.c_reset()}")
                 else:
-                    legend = f"{ansi.c_dim()}Legend: . = ok, x = timeout{ansi.c_reset()}"
-
-                # keep within width
-                if ansi.visible_len(graph) > usable:
-                    # trim from left
-                    # naive: cut raw string (contains ANSI), ok because each sample is small
-                    graph = graph[-usable:]
-
-                print(graph)
-                print(legend)
-                print("")
-                print(f"{ansi.c_dim()}Ctrl+C untuk keluar.{ansi.c_reset()}  {ansi.c_dim()}Tip:{ansi.c_reset()} `ai mon net {target}` untuk diagnosis (dns + wifi).")
-
-                time.sleep(interval)
+                    cnt = int(ms / 8.0)
+                    cnt = int(_clamp(cnt, 1, 40))
+                    col = ansi.c_green()
+                    if ms > 50:
+                        col = ansi.c_yellow()
+                    if ms > 150:
+                        col = ansi.c_red()
+                    bar = f"{col}{'█'*cnt}{ansi.c_reset()}"
+                    print(f"{ts:<10} {ms:>6.1f}ms   {bar}")
+                time.sleep(0.8)
 
     except KeyboardInterrupt:
         pass
@@ -2487,37 +1791,17 @@ def _nvme_model_hint(dev: Optional[str]) -> str:
     return ""
 
 def _fan_label(rpm: Optional[int]) -> str:
-    """
-    Fan label (human-friendly + stable).
-
-    Bands (RPM):
-      - None / <0 : N/A
-      - 0         : OFF
-      - 1–1000    : Very Low
-      - 1001–3000 : Low
-      - 3001–4500 : Medium
-      - >=4501    : High
-
-    Note:
-    - Some laptops report 0 RPM when the fan is truly stopped.
-    - If your hardware doesn't expose RPM, caller passes None.
-    """
-    if rpm is None or not isinstance(rpm, int):
+    if not isinstance(rpm, int) or rpm <= 0:
         return f"{ansi.c_dim()}N/A{ansi.c_reset()}"
-    if rpm < 0:
-        return f"{ansi.c_dim()}N/A{ansi.c_reset()}"
-    if rpm == 0:
-        return f"{ansi.c_dim()}0 RPM (OFF){ansi.c_reset()}"
-
-    if rpm <= 1000:
-        lvl = f"{ansi.c_green()}Very Low{ansi.c_reset()}"
-    elif rpm <= 3000:
+    # Simple bands; adjustable if needed
+    if rpm < 2500:
+        lvl = f"{ansi.c_green()}Idle{ansi.c_reset()}"
+    elif rpm < 4500:
         lvl = f"{ansi.c_green()}Low{ansi.c_reset()}"
-    elif rpm <= 4500:
-        lvl = f"{ansi.c_yellow()}Medium{ansi.c_reset()}"
+    elif rpm < 6500:
+        lvl = f"{ansi.c_yellow()}Med{ansi.c_reset()}"
     else:
         lvl = f"{ansi.c_red()}High{ansi.c_reset()}"
-
     return f"{lvl}{ansi.c_dim()} ({rpm} RPM){ansi.c_reset()}"
 
 def _cpu_freq_info() -> dict[str, Any]:
@@ -2893,38 +2177,27 @@ def run_live_cockpit(argv: list[str]) -> int:
                 # render
                 ansi.clear_screen()
 
-                # Header (V5) — clearer & grouped (Task Manager-ish)
-                ts = _now_ts()
-
-                title_left = f"{ansi.c_cyan()}{ansi.c_bold()}AI MON{ansi.c_reset()} {ansi.c_dim()}• Live Cockpit{ansi.c_reset()}"
-                title_right = f"{ansi.c_dim()}{ts}{ansi.c_reset()}"
+                # Header (polished + colored + separated)
+                title_left = f"{ansi.c_cyan()}{ansi.c_bold()}AI MONITOR{ansi.c_reset()} {ansi.c_dim()}| LIVE SYSTEM COCKPIT{ansi.c_reset()}"
+                title_right = f"{ansi.c_dim()}AI-Terminal{ansi.c_reset()}"
                 print(_align_lr(title_left, title_right, usable))
 
-                sep = f"{ansi.c_dim()}{ansi.hr(min(usable, 96))}{ansi.c_reset()}"
+                sep = f"{ansi.c_dim()}{'─' * min(usable, 96)}{ansi.c_reset()}"
 
-                # Line: Host + OS / Kernel
-                left_sys = f"{ansi.c_dim()}Host:{ansi.c_reset()} {host}  {ansi.c_dim()}OS:{ansi.c_reset()} {distro or '-'}"
-                right_sys = f"{ansi.c_dim()}Kernel:{ansi.c_reset()} {kernel}"
-                print(_align_lr(left_sys, right_sys, usable))
-
-                # Line: Uptime / Run context
-                cpu_count = os.cpu_count() or 1
-                left_run = f"{ansi.c_dim()}Uptime:{ansi.c_reset()} {_uptime_str()}  {ansi.c_dim()}CPUs:{ansi.c_reset()} {cpu_count}"
-                right_run = f"{ansi.c_dim()}Interval:{ansi.c_reset()} {interval:.1f}s  {ansi.c_dim()}Target:{ansi.c_reset()} {target}"
+                ts = _now_ts()
+                meta = f"{ansi.c_dim()}{ts}{ansi.c_reset()}  {ansi.c_dim()}|{ansi.c_reset()}  Host: {host}  Interval: {interval:.1f}s  Target: {target}"
                 if iface:
-                    right_run += f"  {ansi.c_dim()}Iface:{ansi.c_reset()} {iface}"
-                print(_align_lr(left_run, right_run, usable))
+                    meta += f"  Iface: {iface}"
+                print(meta)
 
-                # Line: Load average explanation (1m/5m/15m) + normalized load per CPU
+                line_os = f"OS: {distro or '-'}"
+                line_kr = f"Kernel: {kernel}"
+                print(f"{ansi.c_dim()}{line_os:<36}  {line_kr}{ansi.c_reset()}")
+
                 la1, la5, la15 = _loadavg()
-                per1 = (la1 / cpu_count) if cpu_count else 0.0
-                per5 = (la5 / cpu_count) if cpu_count else 0.0
-                per15 = (la15 / cpu_count) if cpu_count else 0.0
-
-                left_load = f"{ansi.c_dim()}Load avg (1m/5m/15m):{ansi.c_reset()} {la1:.2f}/{la5:.2f}/{la15:.2f}"
-                right_load = f"{ansi.c_dim()}Load/CPU:{ansi.c_reset()} {per1:.2f}/{per5:.2f}/{per15:.2f}"
-                print(_align_lr(left_load, right_load, usable))
-
+                cpu_count = os.cpu_count() or 1
+                load_line = f"Uptime: {_uptime_str()}   Load avg (1/5/15): {la1:.2f}/{la5:.2f}/{la15:.2f}   CPUs: {cpu_count}"
+                print(f"{ansi.c_dim()}{load_line}{ansi.c_reset()}")
                 print(sep)
 
                 # CPU / RAM / SWAP / I/O (no Top here; moved below)
@@ -3170,45 +2443,24 @@ def handle(argv: list[str], cfg: dict) -> int:
         rest = argv[1:]
 
     if mode in ("help", "-h", "--help"):
-        ansi.print_info("AI Monitor (MON) — System Cockpit & Intelligence")
+        ansi.print_info("AI Monitor (MON)")
+        print('  ai mon live [--interval N] [--compact] [--target HOST] [--iface IFACE] [--disk "LABEL=TARGET"] [--no-disks] [--maxwidth N] : HUD realtime (ANSI).')
+        print("  ai mon sensors                                                      : Daftar semua sensor/field yang bisa dibaca.")
+        print("  ai mon batt                                                         : Battery health + history (time travel).")
+        print("  ai mon disk [--sudo|--deep]                                         : Storage SMART/TBW + history.")
+        print("  ai mon net [target]                                                 : Network diagnostics (ping/dns + wifi detail).")
+        print("  ai mon net live [target]                                            : Live ping graph (alt-screen).")
         print("")
-        print(f"{ansi.c_bold()}USAGE{ansi.c_reset()}")
-        print("  ai mon live [--interval N] [--compact] [--target HOST] [--iface IFACE] [--disk \"LABEL=TARGET\"] [--no-disks] [--maxwidth N]")
-        print("  ai mon sensors")
-        print("  ai mon batt  [--list|--history] [--pick] [--compare YYYY-MM-DD] [--window-months N]")
-        print("  ai mon disk  [--sudo|--deep] [--list|--history] [--pick] [--compare YYYY-MM-DD] [--window-months N] [--only DEV]")
-        print("  ai mon net   [target]")
-        print("  ai mon net live [target] [--interval N] [--window N]")
-        print("")
-        print(f"{ansi.c_bold()}HIGHLIGHTS{ansi.c_reset()}")
-        print("  • live      : HUD realtime (ANSI) — fokus performa + network + thermals.")
-        print("  • sensors   : discovery mode (lihat semua sensor field yang bisa dibaca).")
-        print("  • batt      : battery health + time-travel history (baseline & previous snapshot).")
-        print("  • disk      : SMART/TBW/TBR + history (tanpa maksa sudo).")
-        print("  • net       : ping/dns + wifi detail.")
-        print("  • net live  : ping graph (alt-screen, non-scrolling).")
-        print("")
-        print(f"{ansi.c_bold()}EXAMPLES{ansi.c_reset()}")
-        print("  ai mon live --interval 0.6 --target 1.1.1.1")
-        print("  ai mon live --iface wlp2s0 --disk \"root=/\" --disk \"home=/home\"")
-        print("  ai mon batt --list")
-        print("  ai mon batt --pick")
-        print("  ai mon disk --only nvme0n1")
-        print("  sudo ai mon disk   # full metrics")
-        print("  ai mon net google.com")
-        print("  ai mon net live google.com --window 60")
-        print("")
-        print(f"{ansi.c_bold()}DEPENDENCY (Fedora){ansi.c_reset()}")
+        print("Dependency (Fedora):")
         print("  sudo dnf install python3-psutil")
-        print("")
-        print(f"{ansi.c_bold()}OPTIONAL TOOLS (Fedora){ansi.c_reset()}")
+        print("Optional tools (Fedora):")
         print("  sudo dnf install util-linux iproute iw pciutils lm_sensors smartmontools")
+        print("Optional iGPU advanced (Fedora):")
+        print("  sudo dnf install intel-gpu-tools")
         print("")
-        print(f"{ansi.c_bold()}SUDO PATH NOTE{ansi.c_reset()}")
+        print("Catatan sudo PATH:")
         print("  Jika `sudo ai ...` tidak ketemu, gunakan:")
         print('    sudo env "PATH=$PATH" ai mon disk')
-        print("")
-        print(f"{ansi.c_dim()}History file (default):{ansi.c_reset()} {MON_HISTORY_PATH}")
         return 0
 
     if mode in ("sensors", "probe", "inventory"):
@@ -3223,7 +2475,7 @@ def handle(argv: list[str], cfg: dict) -> int:
         return run_live_cockpit(rest)
 
     if mode in ("batt", "battery", "power"):
-        return run_battery_check(rest)
+        return run_battery_check()
 
     if mode in ("disk", "storage", "smart"):
         return run_disk_check(rest)

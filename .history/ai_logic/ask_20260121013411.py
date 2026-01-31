@@ -1,18 +1,3 @@
-"""AI_IN-TERMINAL — ask
-Version: 1.6 (2026-01-20)
-
-Changelog (1.6)
-- Front-layer output untuk oneshot dibuat lebih rapi, rame tapi tetap enak dibaca (emoji + wrap + persona label).
-- API oneshot ditargetkan ringkas tanpa truncation (rewrite 1x bila kepanjangan).
-- Chat divider pakai ansi.hr() supaya konsisten dengan lebar terminal.
-- Legacy "hello/halo -> chat" dijadikan opt-in (ASK_MAGIC_HELLO=1).
-- Tambah flag --plain untuk output polos (buat piping/scripting).
-
-Notes
-- Command ini terpisah dari "ai". Entry point: `ask ...`
-- API persona: Sili Pinter 💍 (dewasa & nyaman). LOCAL persona: Sili AI 🌿 (teman lembut).
-"""
-
 from __future__ import annotations
 
 import re
@@ -177,7 +162,7 @@ def _ask_help() -> None:
 
 
 def handle(argv: list[str], cfg: dict) -> int:
-    if not argv or argv[0] in ("-h", "--help", "-help"):
+    if not argv or argv[0] in ("-h", "--help", "help"):
         _ask_help()
         return 2
 

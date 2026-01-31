@@ -177,7 +177,7 @@ def _ask_help() -> None:
 
 
 def handle(argv: list[str], cfg: dict) -> int:
-    if not argv or argv[0] in ("-h", "--help", "-help"):
+    if not argv or argv[0] in ("-h", "--help", "help"):
         _ask_help()
         return 2
 
