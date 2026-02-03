@@ -19,8 +19,10 @@ def _root_help() -> None:
     print(f"  {prog} cmd \"...\"")
     print(f"  {prog} ai status")
     print(f"  {prog} ai help")
+    print(f"  {prog} toolkit help")
+    print(f"  {prog} toolkit deps")
     print("\nFish tip:")
-    print("  Kamu bisa pakai fungsi fish (kalau sudah dipasang): ask / cmd / ai")
+    print("  Kamu bisa pakai fungsi fish (kalau sudah dipasang): ask / cmd / ai / toolkit")
 
 
 def dispatch(argv: list[str], cfg: dict) -> int:
@@ -41,6 +43,10 @@ def dispatch(argv: list[str], cfg: dict) -> int:
 
     if root_cmd == "ai":
         from system_logic.commands.ai.command import handle
+        return handle(rest, cfg)
+
+    if root_cmd == "toolkit":
+        from system_logic.commands.toolkit.command import handle
         return handle(rest, cfg)
 
     print_brief_error(f"Command '{root_cmd}' tidak dikenal.")

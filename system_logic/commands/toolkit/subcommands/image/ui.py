@@ -1,0 +1,12 @@
+def render(result):
+    d = result.data
+    print("toolkit image")
+    print("------------")
+    print(f"- URL      : {d['url']}")
+    if d.get("name"):
+        print(f"- Name     : {d['name']}")
+    print(f"- Output   : {d['out_dir']}")
+    if not d["ok"]:
+        print("")
+        print("Details:")
+        print((d.get("raw") or "")[:1200])
