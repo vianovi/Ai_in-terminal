@@ -3,11 +3,11 @@ from __future__ import annotations
 
 import sys
 
-# from ai_logic.common import load_config
-# from ai_logic.bridge import dispatch
+from ai_logic.common import load_config
+from ai_logic.bridge import dispatch
 
-from system_logic.core.config import load_config
-from system_logic.app.bridge import dispatch
+# from system_logic.core.config import load_config
+# from system_logic.app.bridge import dispatch
 
 def main(argv: list[str]) -> int:
     cfg = load_config()

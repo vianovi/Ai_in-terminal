@@ -5,7 +5,7 @@ Entry point untuk semua subcommand 'ai mon'.
 
 from typing import List
 from system_logic.terminal import ansi
-from . import const
+# REMOVED: from . import const  # ← Circular import!
 from .ui import (
     run_live_dashboard,
     run_battery_report,
@@ -125,7 +125,13 @@ def _print_help():
     print("    sudo dnf install lm_sensors smartmontools iw iproute")
     print()
 
-    print(f"{ansi.c_dim()}History file:{ansi.c_reset()} {const.MON_HISTORY_PATH}")
+    # Import const hanya di sini, bukan di top-level (avoid circular import)
+    try:
+        from . import const
+        print(f"{ansi.c_dim()}History DB:{ansi.c_reset()} {const.MON_HISTORY_PATH}")
+    except ImportError:
+        # Fallback jika const error
+        print(f"{ansi.c_dim()}History DB:{ansi.c_reset()} ~/.config/ai-term/mon_data/history.db")
 
 
 def _run_net_live(args: List[str]) -> int:
