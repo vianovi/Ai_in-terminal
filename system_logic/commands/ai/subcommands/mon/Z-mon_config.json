@@ -1,0 +1,71 @@
+{
+  "version": 5.0,
+  "sentinel": {
+    "enabled": true,
+    "interval_seconds": 1.0,
+    "log_path": "/home/silinux/.cache/ai-term/sentinel_guard.log",
+    "thresholds": {
+      "phase1_log": {
+        "ram_pct": 87.0,
+        "swap_pct": 50.0
+      },
+      "phase2_warn": {
+        "ram_pct": 90.0,
+        "swap_pct": 78.0
+      },
+      "phase3_kill": {
+        "ram_pct": 90.0,
+        "ram_hold_sec": 5,
+        "swap_pct": 87.0
+      }
+    },
+    "whitelist": [
+      "systemd",
+      "init",
+      "Xorg",
+      "wayland",
+      "kwin_wayland",
+      "gnome-shell",
+      "surfaceflinger",
+      "dbus-daemon",
+      "dbus-broker",
+      "pipewire",
+      "pulseaudio",
+      "wireplumber",
+      "NetworkManager",
+      "wpa_supplicant",
+      "sshd",
+      "login",
+      "bash",
+      "fish",
+      "zsh",
+      "python",
+      "python3",
+      "ai-term",
+      "code",
+      "dockerd",
+      "containerd"
+    ],
+    "kill_strategy": "largest_rss"
+  },
+  "ui": {
+    "refresh_rate": 1.0,
+    "show_disks": true,
+    "compact_mode": false,
+    "limits": {
+      "cpu_warn": 70,
+      "cpu_crit": 90,
+      "ram_warn": 80,
+      "ram_crit": 90,
+      "temp_warn": 70,
+      "temp_crit": 85,
+      "ping_warn": 50,
+      "ping_crit": 150
+    }
+  },
+  "collectors": {
+    "ping_target": "google.com",
+    "ping_interval": 2.0,
+    "disk_history_window_months": 30
+  }
+}

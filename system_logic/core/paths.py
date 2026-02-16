@@ -27,3 +27,26 @@ RUN_PROFILE_PATH = APP_DIR / "run_profile.json"
 LOGIC_PATH = Path.home() / ".local" / "bin" / "ai-term"
 FISH_DIR = Path.home() / ".config" / "fish"
 FISH_FUNCS_DIR = FISH_DIR / "functions"
+
+# ============================================================
+# MON (Monitoring System) paths
+# ============================================================
+# Tambahkan di bawah existing paths
+
+# MON data directory (untuk SQLite database)
+MON_DATA_DIR = APP_DIR / "mon_data"
+
+# MON history database (SQLite untuk performance)
+MON_HISTORY_DB = MON_DATA_DIR / "history.db"
+
+# MON Sentinel logs directory
+MON_LOG_DIR = APP_DIR / "mon_logs"
+SENTINEL_LOG_PATH = MON_LOG_DIR / "sentinel.log"
+SENTINEL_LOG_ARCHIVE = MON_LOG_DIR / "archive"
+
+# MON config (tetap JSON, jarang diubah)
+MON_CONFIG_PATH = APP_DIR / "mon_config.json"
+
+# Lock files untuk prevent concurrent access
+MON_LOCK_DIR = APP_DIR / "mon_locks"
+MON_HISTORY_LOCK = MON_LOCK_DIR / "history.lock"
