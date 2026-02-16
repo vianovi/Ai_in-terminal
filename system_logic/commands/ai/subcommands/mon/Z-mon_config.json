@@ -7,16 +7,16 @@
     "thresholds": {
       "phase1_log": {
         "ram_pct": 87.0,
-        "swap_pct": 50.0
+        "swap_pct": 80.0
       },
       "phase2_warn": {
         "ram_pct": 90.0,
-        "swap_pct": 78.0
+        "swap_pct": 85.0
       },
       "phase3_kill": {
         "ram_pct": 90.0,
-        "ram_hold_sec": 5,
-        "swap_pct": 87.0
+        "ram_hold_sec": 10,
+        "swap_pct": 95.0
       }
     },
     "whitelist": [

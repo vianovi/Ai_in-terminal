@@ -50,3 +50,21 @@ MON_CONFIG_PATH = APP_DIR / "mon_config.json"
 # Lock files untuk prevent concurrent access
 MON_LOCK_DIR = APP_DIR / "mon_locks"
 MON_HISTORY_LOCK = MON_LOCK_DIR / "history.lock"
+
+"""
+=== ADDITION TO system_logic/core/paths.py ===
+Append these lines to the EXISTING paths.py file
+"""
+
+from pathlib import Path
+
+# MON Framework paths (ADD THESE)
+MON_DATA_DIR = APP_DIR / "mon_data"
+MON_HISTORY_DB = MON_DATA_DIR / "history.db"
+MON_HISTORY_PATH = APP_DIR / "mon_history.json"  # Legacy
+MON_HISTORY_LOCK = APP_DIR / "mon_locks" / "history.lock"
+MON_CONFIG_PATH = APP_DIR / "mon_config.json"
+MON_LOG_DIR = APP_DIR / "mon_logs"
+SENTINEL_LOG_PATH = MON_LOG_DIR / "sentinel.log"
+SENTINEL_LOG_ARCHIVE = MON_LOG_DIR / "archive"
+MON_LOCK_DIR = APP_DIR / "mon_locks"

@@ -368,3 +368,249 @@ def migrate_json_to_sqlite(json_path, db_path, lock_path) -> int:
 
         finally:
             conn.close()
+
+"""
+=== ADDITION TO system_logic/core/storage.py ===
+Append these functions to the EXISTING storage.py file
+"""
+
+import sqlite3
+import fcntl
+from contextlib import contextmanager
+from datetime import date, datetime
+from pathlib import Path
+from typing import Optional, List, Dict, Any
+
+
+@contextmanager
+def file_lock(lock_path):
+    """Context manager untuk file locking dengan fcntl."""
+    lock_path = Path(lock_path)
+
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    f = open(lock_path, "w")
+    try:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        yield
+    finally:
+        try:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+        except Exception:
+            pass
+        try:
+            f.close()
+        except Exception:
+            pass
+
+
+def init_mon_history_db(db_path) -> None:
+    """Initialize MON history database schema."""
+    db_path = Path(db_path)
+
+    try:
+        db_path.parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                category TEXT NOT NULL,
+                item_id TEXT NOT NULL,
+                metric TEXT NOT NULL,
+                date TEXT NOT NULL,
+                value REAL NOT NULL,
+                created_at TEXT NOT NULL,
+                UNIQUE(category, item_id, metric, date)
+            )
+        """)
+
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_lookup
+            ON metrics(category, item_id, metric, date)
+        """)
+
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def snapshot_metric_sql(
+    db_path,
+    lock_path,
+    category: str,
+    item_id: str,
+    metric: str,
+    value: float
+) -> bool:
+    """Save daily snapshot ke SQLite database."""
+    db_path = Path(db_path)
+    lock_path = Path(lock_path)
+
+    today = date.today().isoformat()
+    now = datetime.now().isoformat()
+
+    if not db_path.exists():
+        init_mon_history_db(db_path)
+
+    with file_lock(lock_path):
+        conn = sqlite3.connect(str(db_path))
+        try:
+            cursor = conn.execute(
+                "SELECT 1 FROM metrics WHERE category=? AND item_id=? AND metric=? AND date=?",
+                (category, item_id, metric, today)
+            )
+
+            if cursor.fetchone():
+                return False
+
+            conn.execute(
+                "INSERT INTO metrics (category, item_id, metric, date, value, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (category, item_id, metric, today, value, now)
+            )
+            conn.commit()
+            return True
+
+        finally:
+            conn.close()
+
+
+def get_metric_value_sql(
+    db_path,
+    category: str,
+    item_id: str,
+    metric: str,
+    date_iso: str
+) -> Optional[float]:
+    """Ambil nilai metric pada tanggal tertentu."""
+    db_path = Path(db_path)
+
+    if not db_path.exists():
+        return None
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.execute(
+            "SELECT value FROM metrics WHERE category=? AND item_id=? AND metric=? AND date=?",
+            (category, item_id, metric, date_iso)
+        )
+        row = cursor.fetchone()
+        return row[0] if row else None
+    finally:
+        conn.close()
+
+
+def list_metric_dates_sql(
+    db_path,
+    category: str,
+    item_id: str,
+    metric: str
+) -> List[str]:
+    """List semua tanggal yang ada untuk metric tertentu (sorted)."""
+    db_path = Path(db_path)
+
+    if not db_path.exists():
+        return []
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.execute(
+            "SELECT date FROM metrics WHERE category=? AND item_id=? AND metric=? ORDER BY date ASC",
+            (category, item_id, metric)
+        )
+        return [row[0] for row in cursor.fetchall()]
+    finally:
+        conn.close()
+
+
+def get_all_metrics_sql(db_path) -> Dict[str, Any]:
+    """Get semua data dalam format dict."""
+    db_path = Path(db_path)
+
+    if not db_path.exists():
+        return {}
+
+    result: Dict[str, Any] = {}
+
+    conn = sqlite3.connect(str(db_path))
+    try:
+        cursor = conn.execute("SELECT category, item_id, metric, date, value FROM metrics")
+
+        for row in cursor.fetchall():
+            cat, item, met, dt, val = row
+
+            if cat not in result:
+                result[cat] = {}
+            if item not in result[cat]:
+                result[cat][item] = {}
+            if met not in result[cat][item]:
+                result[cat][item][met] = {}
+
+            result[cat][item][met][dt] = val
+
+        return result
+    finally:
+        conn.close()
+
+
+def migrate_json_to_sqlite(json_path, db_path, lock_path) -> int:
+    """Migrate data dari JSON lama ke SQLite baru."""
+    json_path = Path(json_path)
+    db_path = Path(db_path)
+    lock_path = Path(lock_path)
+
+    if not json_path.exists():
+        return 0
+
+    data = read_json_safe(json_path, default={})
+    if not data:
+        return 0
+
+    if not db_path.exists():
+        init_mon_history_db(db_path)
+
+    count = 0
+    now = datetime.now().isoformat()
+
+    with file_lock(lock_path):
+        conn = sqlite3.connect(str(db_path))
+        try:
+            for category, items in data.items():
+                if not isinstance(items, dict):
+                    continue
+
+                for item_id, metrics in items.items():
+                    if not isinstance(metrics, dict):
+                        continue
+
+                    for metric, dates in metrics.items():
+                        if not isinstance(dates, dict):
+                            continue
+
+                        for date_iso, value in dates.items():
+                            try:
+                                cursor = conn.execute(
+                                    "SELECT 1 FROM metrics WHERE category=? AND item_id=? AND metric=? AND date=?",
+                                    (category, item_id, metric, date_iso)
+                                )
+
+                                if not cursor.fetchone():
+                                    conn.execute(
+                                        "INSERT INTO metrics (category, item_id, metric, date, value, created_at) VALUES (?, ?, ?, ?, ?, ?)",
+                                        (category, item_id, metric, date_iso, float(value), now)
+                                    )
+                                    count += 1
+                            except Exception:
+                                continue
+
+            conn.commit()
+            return count
+
+        finally:
+            conn.close()
