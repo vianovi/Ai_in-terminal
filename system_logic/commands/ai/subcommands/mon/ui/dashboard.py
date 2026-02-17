@@ -1,6 +1,8 @@
 """
-MON Live Dashboard - FIXED VERSION
-Wrapper functions added to bridge dashboard with collectors
+MON Live Dashboard - COMPLETE FIXED VERSION
+✅ All wrapper functions working
+✅ Proper imports
+✅ CPU priming in correct location
 """
 
 from __future__ import annotations
@@ -9,6 +11,9 @@ import os
 import time
 import shutil
 import socket
+import threading
+import subprocess
+from collections import deque
 from typing import Optional, List, Tuple, Dict, Any
 
 try:
@@ -25,8 +30,8 @@ from system_logic.core.storage import (
 
 from ..config import load_config
 from ..collectors.system import collect_system_stats
-from ..collectors.hardware import collect_hardware_stats, collect_battery_stats, collect_thermal_stats
-from ..collectors.network import collect_network_stats, collect_wifi_stats, PingMonitor
+from ..collectors.hardware import collect_hardware_stats, collect_battery_stats
+from ..collectors.network import collect_network_stats, collect_wifi_stats
 from ..collectors.process import collect_process_stats
 
 from ..utils import (
@@ -43,19 +48,18 @@ from ..utils import (
     col_by_dbm,
 )
 
-
 # ==========================================================
-# WRAPPER FUNCTIONS (Bridge collectors with dashboard)
+# SYSTEM WRAPPERS
 # ==========================================================
 
 def get_cpu_percent() -> float:
-    """Wrapper for CPU percentage."""
+    """Get CPU percentage."""
     stats = collect_system_stats()
     return float(stats.get('cpu_pct', 0.0))
 
 
 def get_memory_info() -> Tuple[float, float, float]:
-    """Wrapper for memory info. Returns (pct, used, total)."""
+    """Get memory info: (pct, used_bytes, total_bytes)."""
     stats = collect_system_stats()
     return (
         float(stats.get('ram_pct', 0.0)),
@@ -65,7 +69,7 @@ def get_memory_info() -> Tuple[float, float, float]:
 
 
 def get_swap_info() -> Dict[str, Any]:
-    """Wrapper for swap info."""
+    """Get swap info."""
     stats = collect_system_stats()
     return {
         'ok': stats.get('ok', False),
@@ -76,7 +80,7 @@ def get_swap_info() -> Dict[str, Any]:
 
 
 def get_loadavg() -> Tuple[float, float, float]:
-    """Wrapper for load average."""
+    """Get load average: (1m, 5m, 15m)."""
     stats = collect_system_stats()
     return (
         float(stats.get('load_1m', 0.0)),
@@ -86,7 +90,7 @@ def get_loadavg() -> Tuple[float, float, float]:
 
 
 def get_uptime_str() -> str:
-    """Wrapper for uptime string."""
+    """Get formatted uptime string."""
     stats = collect_system_stats()
     secs = stats.get('uptime_sec', 0)
     if not secs:
@@ -99,49 +103,194 @@ def get_uptime_str() -> str:
     return f"{d}d {h}h {m}m"
 
 
-def read_temperatures() -> Dict[str, Optional[float]]:
-    """Wrapper for temperatures."""
-    hw = collect_hardware_stats()
-    thermal = hw.get('thermal', {})
-    temps = thermal.get('temperatures', {})
+# ==========================================================
+# HARDWARE WRAPPERS
+# ==========================================================
 
-    return {
-        'cpu': temps.get('cpu_package', {}).get('current'),
-        'ssd': temps.get('nvme', {}).get('current'),
-        'wifi': temps.get('wifi', {}).get('current')
-    }
+def read_temperatures() -> Dict[str, Optional[float]]:
+    """
+    Get temperature readings.
+    Logic sama dengan ThermalReader.read_key_temps() di mon.py asli.
+    Langsung pakai psutil untuk menghindari indirection.
+    """
+    res: Dict[str, Optional[float]] = {"cpu": None, "ssd": None, "wifi": None}
+    if psutil is None:
+        return res
+    try:
+        temps = psutil.sensors_temperatures(fahrenheit=False) or {}
+    except Exception:
+        return res
+
+    # CPU temp: cari coretemp/k10temp dengan label 'package' atau 'tctl'
+    for key in ("coretemp", "k10temp"):
+        entries = temps.get(key) or []
+        best = None
+        for e in entries:
+            lab = (getattr(e, "label", "") or "").lower()
+            if ("package" in lab) or ("tctl" in lab):
+                best = getattr(e, "current", None)
+                break
+        if best is None and entries:
+            best = getattr(entries[0], "current", None)
+        if best is not None:
+            res["cpu"] = float(best)
+            break
+
+    # SSD/NVMe temp: cari key yang mengandung 'nvme' atau 'composite'
+    for k, entries in temps.items():
+        lk = k.lower()
+        if "nvme" in lk or "composite" in lk:
+            for e in entries:
+                lab = (getattr(e, "label", "") or "").lower()
+                if ("composite" in lab) or (lab == ""):
+                    cur = getattr(e, "current", None)
+                    if cur is not None:
+                        res["ssd"] = float(cur)
+                        break
+            if res["ssd"] is not None:
+                break
+
+    # WiFi temp: cari key yang mengandung 'iwl', 'wifi', atau 'ath'
+    for k, entries in temps.items():
+        lk = k.lower()
+        if ("iwl" in lk) or ("wifi" in lk) or ("ath" in lk):
+            cur = getattr(entries[0], "current", None) if entries else None
+            if cur is not None:
+                res["wifi"] = float(cur)
+                break
+
+    return res
 
 
 def read_fan_rpm() -> Optional[int]:
-    """Wrapper for fan RPM."""
-    hw = collect_hardware_stats()
-    thermal = hw.get('thermal', {})
-    fans = thermal.get('fans', {})
+    """
+    Get fan RPM.
+    Logic sama dengan ThermalReader.read_fan_rpm() di mon.py asli.
+    Langsung pakai psutil untuk akurasi.
+    """
+    if psutil is None:
+        return None
+    try:
+        fans = psutil.sensors_fans() or {}
+    except Exception:
+        return None
 
-    # Return first fan found
-    for rpm in fans.values():
-        if isinstance(rpm, (int, float)) and rpm > 0:
-            return int(rpm)
-    return None
+    best: Optional[int] = None
+    for _k, entries in fans.items():
+        for e in entries:
+            lab = (getattr(e, "label", "") or "").lower()
+            cur = getattr(e, "current", None)
+            if cur is None:
+                continue
+            if "cpu" in lab:
+                return int(cur)
+            if best is None or int(cur) > best:
+                best = int(cur)
+    return best
 
 
 def read_power() -> Dict[str, Any]:
-    """Wrapper for power info."""
-    batt = collect_battery_stats()
-    return {
-        'ok': batt.get('ok', False),
-        'percent': batt.get('percent'),
-        'status_raw': batt.get('status', 'Unknown'),
-        'plugged': batt.get('plugged', False),
-        'watt_str': batt.get('power_w_str', 'N/A'),
-        'volt_str': batt.get('voltage_v_str', 'N/A'),
-        'amp_str': batt.get('current_a_str', 'N/A'),
-        'secs_left': batt.get('time_left_sec')
+    """
+    Get power/battery info via sysfs.
+    Logic sama dengan PowerReader.read() di mon.py asli.
+    Baca langsung dari sysfs untuk watt/volt/amp yang presisi.
+    """
+    from pathlib import Path
+
+    def _sysfs_text(p: Path) -> Optional[str]:
+        try:
+            return p.read_text().strip() or None
+        except Exception:
+            return None
+
+    def _sysfs_float(p: Path) -> Optional[float]:
+        try:
+            return float(p.read_text().strip())
+        except Exception:
+            return None
+
+    res: Dict[str, Any] = {
+        "ok": False,
+        "status_raw": "Unknown",
+        "percent": None,
+        "secs_left": None,
+        "plugged": None,
+        "watt": None,
+        "volt": None,
+        "amp": None,
+        "watt_str": "N/A",
+        "volt_str": "N/A",
+        "amp_str": "N/A",
+        "batt_name": "",
     }
+
+    # Find battery path
+    base = Path("/sys/class/power_supply")
+    batt = None
+    if base.exists():
+        bats = sorted(base.glob("BAT*"))
+        batt = bats[0] if bats else None
+
+    if batt is None:
+        return res
+
+    res["batt_name"] = batt.name
+    res["status_raw"] = _sysfs_text(batt / "status") or "Unknown"
+
+    # Percent + plugged + secs_left via psutil
+    if psutil is not None:
+        try:
+            b = psutil.sensors_battery()
+            if b:
+                res["percent"] = int(getattr(b, "percent", 0) or 0)
+                res["plugged"] = bool(getattr(b, "power_plugged", False))
+                res["secs_left"] = getattr(b, "secsleft", None)
+        except Exception:
+            pass
+
+    # Voltage
+    v_uv = _sysfs_float(batt / "voltage_now")
+    if v_uv is not None:
+        res["volt"] = float(v_uv) / 1e6
+
+    # Power (watt)
+    p_uw = None
+    if (batt / "power_now").exists():
+        p_uw = _sysfs_float(batt / "power_now")
+    elif (batt / "power_avg").exists():
+        p_uw = _sysfs_float(batt / "power_avg")
+
+    # Current (amp)
+    c_ua = None
+    if (batt / "current_now").exists():
+        c_ua = _sysfs_float(batt / "current_now")
+
+    if p_uw is not None:
+        res["watt"] = float(p_uw) / 1e6
+    elif (c_ua is not None) and (res["volt"] is not None):
+        a = float(c_ua) / 1e6
+        res["amp"] = a
+        res["watt"] = float(res["volt"]) * a
+
+    # Derive amp from watt/volt if missing
+    if (res["amp"] is None) and (res["watt"] is not None) and (res["volt"] is not None) and (res["volt"] > 0):
+        res["amp"] = float(res["watt"]) / float(res["volt"])
+
+    # Format strings
+    if res["watt"] is not None:
+        w = float(res["watt"])
+        res["watt_str"] = f"{w*1000:.0f} mW" if w < 1.0 else f"{w:.2f} W"
+    if res["volt"] is not None:
+        res["volt_str"] = f"{float(res['volt']):.2f} V"
+    if res["amp"] is not None:
+        res["amp_str"] = f"{float(res['amp']):.3f} A"
+
+    res["ok"] = True
+    return res
 
 
 def read_power_capacity() -> Dict[str, Any]:
-    """Wrapper for battery capacity."""
+    """Get battery capacity/health info."""
     batt = collect_battery_stats()
     return {
         'ok': batt.get('health_ok', False),
@@ -154,35 +303,57 @@ def read_power_capacity() -> Dict[str, Any]:
     }
 
 
+# ==========================================================
+# PROCESS WRAPPERS (FIXED)
+# ==========================================================
+
 def get_top_cpu_processes(total_cpu: float, n: int = 3) -> List[Tuple[str, float, float]]:
-    """Wrapper for top CPU processes."""
-    procs = collect_process_stats(limit=n)
+    """
+    Get top CPU processes.
+    Returns: List of (name, cpu_pct, share_of_total)
+    """
+    procs = collect_process_stats(limit=20)
     if not procs.get('ok'):
         return []
 
-    top = procs.get('top_cpu', [])
-    result = []
+    processes = procs.get('processes', [])
+    if not processes:
+        return []
 
-    for p in top[:n]:
+    # Sort by CPU percentage
+    sorted_procs = sorted(processes, key=lambda x: x.get('cpu_pct', 0.0), reverse=True)
+
+    result = []
+    for p in sorted_procs[:n]:
         name = p.get('name', '?')
-        pct = float(p.get('cpu_pct', 0.0))
-        share = (pct / total_cpu * 100.0) if total_cpu > 0.1 else 0.0
+        cpu_pct = float(p.get('cpu_pct', 0.0))
+
+        # Calculate share
+        share = 0.0
+        if total_cpu > 0.1:
+            share = (cpu_pct / total_cpu) * 100.0
         share = clamp(share, 0.0, 100.0)
-        result.append((name, pct, share))
+
+        result.append((name, cpu_pct, share))
 
     return result
 
 
 def get_top_mem_processes(n: int = 3) -> List[Tuple[str, float]]:
-    """Wrapper for top memory processes."""
+    """
+    Get top memory processes.
+    Returns: List of (name, rss_gib)
+    """
     procs = collect_process_stats(limit=n)
     if not procs.get('ok'):
         return []
 
-    top = procs.get('top_mem', [])
-    result = []
+    processes = procs.get('processes', [])
+    if not processes:
+        return []
 
-    for p in top[:n]:
+    result = []
+    for p in processes:
         name = p.get('name', '?')
         rss_gib = float(p.get('rss_mb', 0.0)) / 1024.0
         result.append((name, rss_gib))
@@ -190,8 +361,13 @@ def get_top_mem_processes(n: int = 3) -> List[Tuple[str, float]]:
     return result
 
 
+# ==========================================================
+# NETWORK WRAPPERS
+# ==========================================================
+
 class NetSpeedometer:
-    """Wrapper for network speedometer."""
+    """Network speed monitor."""
+
     def __init__(self, iface: Optional[str] = None):
         self.iface = iface
         self.rx = 0.0
@@ -200,6 +376,7 @@ class NetSpeedometer:
         self.prev_time = time.time()
 
     def update(self):
+        """Update network speed readings."""
         stats = collect_network_stats(iface=self.iface)
         if not stats.get('ok'):
             return
@@ -225,9 +402,11 @@ class NetSpeedometer:
 
 
 class WiFiReader:
+    """WiFi stats reader."""
+
     @staticmethod
     def read(iface: Optional[str] = None) -> Dict[str, Any]:
-        """Wrapper for WiFi stats."""
+        """Get WiFi stats."""
         wifi = collect_wifi_stats(iface=iface)
         return {
             'ok': wifi.get('ok', False),
@@ -240,35 +419,90 @@ class WiFiReader:
 
 
 class PingSampler:
-    """Wrapper for ping sampler."""
-    def __init__(self, target: str, interval: float = 5.0):
-        self.monitor = PingMonitor(target=target, window=60)
-        self.last_ms = None
+    """
+    Background ping sampler.
+    Self-contained, persis dari mon.py asli - tidak memakai PingMonitor.
 
-    def start(self):
-        self.monitor.start()
+    DNS Optimization: Resolve hostname SEKALI di __init__, ping berikutnya
+    langsung ke IP — tidak ada DNS lookup berulang di setiap interval.
+    Mekanisme ini selaras dengan PingMonitor di collectors/network.py.
+    """
+    def __init__(self, target: str, interval: float = 5.0) -> None:
+        self.target = target          # Hostname asli (untuk display)
+        self.interval = float(clamp(interval, 1.0, 30.0))
+        self.last_ms: Optional[float] = None
+        self.window: deque = deque(maxlen=20)
+        self._stop = threading.Event()
+        self._thr = threading.Thread(target=self._run, daemon=True)
 
-    def stop(self):
-        self.monitor.stop()
+        # DNS Pre-resolve: resolve SEKALI, simpan IP-nya.
+        # Ping loop berikutnya pakai self.resolved_ip — kernel tidak perlu
+        # tanya DNS resolver lagi. Jika DNS mati di tengah jalan, ping tetap jalan.
+        self.resolved_ip: Optional[str] = None
+        try:
+            self.resolved_ip = socket.gethostbyname(target)
+        except socket.gaierror:
+            self.resolved_ip = target  # Fallback: target sudah berupa IP
+
+    def start(self) -> None:
+        """Start background ping thread."""
+        if not self._thr.is_alive():
+            self._thr.start()
+
+    def stop(self) -> None:
+        """Stop background ping thread."""
+        self._stop.set()
 
     def avg(self) -> Optional[float]:
-        stats = self.monitor.get_stats()
-        return stats.get('avg_ping')
+        """Get average ping dari window."""
+        if not self.window:
+            return None
+        return sum(self.window) / float(len(self.window))
 
     def jitter(self) -> Optional[float]:
-        stats = self.monitor.get_stats()
-        return stats.get('jitter')
+        """Get jitter (max-min dari window)."""
+        if len(self.window) < 3:
+            return None
+        return max(self.window) - min(self.window)
 
-    def update_last(self):
-        stats = self.monitor.get_stats()
-        self.last_ms = stats.get('last_ping')
+    def _ping_once(self) -> Optional[float]:
+        """
+        Single ping ke resolved_ip (bukan hostname) — return ms atau None.
+        Menggunakan IP langsung: kernel tidak perlu DNS lookup per iterasi.
+        """
+        if not shutil.which("ping"):
+            return None
+        # Gunakan resolved_ip (IP address), bukan self.target (hostname).
+        # Ini memastikan zero DNS overhead di setiap ping call.
+        ping_target = self.resolved_ip if self.resolved_ip else self.target
+        try:
+            out = subprocess.check_output(
+                ["ping", "-c", "1", "-W", "1", ping_target],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=2,
+            )
+            if "time=" in out:
+                s = out.split("time=", 1)[1].split()[0]
+                return float(s)
+        except Exception:
+            return None
+        return None
 
-
-
-# ==========================================================
-# DISK I/O SAMPLER (same as original)
-# ==========================================================
-
+    def _run(self) -> None:
+        """Background thread loop."""
+        while not self._stop.is_set():
+            t0 = time.time()
+            ms = self._ping_once()
+            if ms is not None:
+                self.last_ms = ms
+                self.window.append(ms)
+            else:
+                self.last_ms = None
+            dt = time.time() - t0
+            wait = self.interval - dt
+            if wait > 0:
+                self._stop.wait(wait)
 class DiskIOSampler:
     """Sampling /sys/block/<dev>/stat for active% and R/W speed."""
 
@@ -662,6 +896,410 @@ def _fmt_topmem(rows: list[tuple[str, float]], name_w: int = 16) -> list[str]:
     return out
 
 
+
+
+# ==========================================================
+# THROTTLE READER (Intel thermal throttle indicator)
+# Persis dari ThrottleReader di mon.py asli
+# ==========================================================
+
+class ThrottleReader:
+    """Best-effort thermal throttling indicator (Intel-friendly)."""
+
+    def __init__(self) -> None:
+        self.prev_core: Optional[int] = None
+        self.prev_pkg: Optional[int] = None
+
+    def read(self) -> Dict[str, Any]:
+        from pathlib import Path as _Path
+        base = _Path("/sys/devices/system/cpu/cpu0/thermal_throttle")
+        core_p = base / "core_throttle_count"
+        pkg_p  = base / "package_throttle_count"
+        if not core_p.exists() and not pkg_p.exists():
+            return {"ok": False}
+
+        def _ri(p: Any) -> Optional[int]:
+            try:
+                return int(p.read_text().strip())
+            except Exception:
+                return None
+
+        core = _ri(core_p) if core_p.exists() else None
+        pkg  = _ri(pkg_p)  if pkg_p.exists()  else None
+
+        delta_core = None
+        delta_pkg  = None
+        if isinstance(core, int) and isinstance(self.prev_core, int):
+            delta_core = core - self.prev_core
+        if isinstance(pkg, int) and isinstance(self.prev_pkg, int):
+            delta_pkg = pkg - self.prev_pkg
+
+        self.prev_core = core if isinstance(core, int) else self.prev_core
+        self.prev_pkg  = pkg  if isinstance(pkg,  int) else self.prev_pkg
+
+        active = False
+        if isinstance(delta_core, int) and delta_core > 0:
+            active = True
+        if isinstance(delta_pkg, int) and delta_pkg > 0:
+            active = True
+
+        return {
+            "ok": True,
+            "core": core,
+            "pkg": pkg,
+            "delta_core": delta_core,
+            "delta_pkg": delta_pkg,
+            "active": active,
+        }
+
+# ==========================================================
+# INTERNAL HELPERS (direct readers, no wrapper overhead)
+# Diambil langsung dari logika mon.py asli
+# ==========================================================
+
+def _swap_read() -> Dict[str, Any]:
+    """Baca swap memory langsung via psutil."""
+    out: Dict[str, Any] = {"ok": False, "pct": 0.0, "used": 0, "total": 0}
+    if psutil is None:
+        return out
+    try:
+        sw = psutil.swap_memory()
+        out.update({"ok": True, "pct": float(sw.percent), "used": int(sw.used), "total": int(sw.total)})
+    except Exception:
+        pass
+    return out
+
+
+def _read_key_temps() -> Dict[str, Optional[float]]:
+    """
+    Baca temperatur kunci (CPU/NVMe/WiFi) langsung via psutil.
+    Logic persis dari ThermalReader.read_key_temps() di mon.py asli.
+    """
+    res: Dict[str, Optional[float]] = {"cpu": None, "ssd": None, "wifi": None}
+    if psutil is None:
+        return res
+    try:
+        temps = psutil.sensors_temperatures(fahrenheit=False) or {}
+    except Exception:
+        return res
+
+    # CPU: coretemp (Intel) atau k10temp (AMD), label 'package' atau 'tctl'
+    for key in ("coretemp", "k10temp"):
+        entries = temps.get(key) or []
+        best = None
+        for e in entries:
+            lab = (getattr(e, "label", "") or "").lower()
+            if ("package" in lab) or ("tctl" in lab):
+                best = getattr(e, "current", None)
+                break
+        if best is None and entries:
+            best = getattr(entries[0], "current", None)
+        if best is not None:
+            res["cpu"] = float(best)
+            break
+
+    # SSD/NVMe: key mengandung 'nvme' atau 'composite'
+    for k, entries in temps.items():
+        lk = k.lower()
+        if "nvme" in lk or "composite" in lk:
+            for e in entries:
+                lab = (getattr(e, "label", "") or "").lower()
+                if ("composite" in lab) or (lab == ""):
+                    cur = getattr(e, "current", None)
+                    if cur is not None:
+                        res["ssd"] = float(cur)
+                        break
+            if res["ssd"] is not None:
+                break
+
+    # WiFi: key mengandung 'iwl', 'wifi', atau 'ath'
+    for k, entries in temps.items():
+        lk = k.lower()
+        if ("iwl" in lk) or ("wifi" in lk) or ("ath" in lk):
+            cur = getattr(entries[0], "current", None) if entries else None
+            if cur is not None:
+                res["wifi"] = float(cur)
+                break
+
+    return res
+
+
+def _read_fan_rpm() -> Optional[int]:
+    """
+    Baca fan RPM langsung via psutil.
+    Logic persis dari ThermalReader.read_fan_rpm() di mon.py asli.
+    """
+    if psutil is None:
+        return None
+    try:
+        fans = psutil.sensors_fans() or {}
+    except Exception:
+        return None
+
+    best: Optional[int] = None
+    for _k, entries in fans.items():
+        for e in entries:
+            lab = (getattr(e, "label", "") or "").lower()
+            cur = getattr(e, "current", None)
+            if cur is None:
+                continue
+            if "cpu" in lab:
+                return int(cur)
+            if best is None or int(cur) > best:
+                best = int(cur)
+    return best
+
+
+def _read_power() -> Dict[str, Any]:
+    """
+    Baca power/battery via sysfs + psutil.
+    Logic persis dari PowerReader.read() di mon.py asli.
+    """
+    from pathlib import Path as _Path
+
+    def _rt(p: Any) -> Optional[str]:
+        try:
+            return p.read_text().strip() or None
+        except Exception:
+            return None
+
+    def _rf(p: Any) -> Optional[float]:
+        try:
+            return float(p.read_text().strip())
+        except Exception:
+            return None
+
+    res: Dict[str, Any] = {
+        "ok": False, "status_raw": "Unknown",
+        "percent": None, "secs_left": None, "plugged": None,
+        "watt": None, "volt": None, "amp": None,
+        "watt_str": "N/A", "volt_str": "N/A", "amp_str": "N/A",
+        "batt_name": "",
+    }
+
+    base = _Path("/sys/class/power_supply")
+    batt = None
+    if base.exists():
+        bats = sorted(base.glob("BAT*"))
+        batt = bats[0] if bats else None
+
+    if batt is None:
+        return res
+
+    res["batt_name"] = batt.name
+    res["status_raw"] = _rt(batt / "status") or "Unknown"
+
+    if psutil is not None:
+        try:
+            b = psutil.sensors_battery()
+            if b:
+                res["percent"] = int(getattr(b, "percent", 0) or 0)
+                res["plugged"] = bool(getattr(b, "power_plugged", False))
+                res["secs_left"] = getattr(b, "secsleft", None)
+        except Exception:
+            pass
+
+    v_uv = _rf(batt / "voltage_now")
+    if v_uv is not None:
+        res["volt"] = float(v_uv) / 1e6
+
+    p_uw = None
+    if (batt / "power_now").exists():
+        p_uw = _rf(batt / "power_now")
+    elif (batt / "power_avg").exists():
+        p_uw = _rf(batt / "power_avg")
+
+    c_ua = None
+    if (batt / "current_now").exists():
+        c_ua = _rf(batt / "current_now")
+
+    if p_uw is not None:
+        res["watt"] = float(p_uw) / 1e6
+    elif (c_ua is not None) and (res["volt"] is not None):
+        a = float(c_ua) / 1e6
+        res["amp"] = a
+        res["watt"] = float(res["volt"]) * a
+
+    if (res["amp"] is None) and (res["watt"] is not None) and (res["volt"] is not None) and (res["volt"] > 0):
+        res["amp"] = float(res["watt"]) / float(res["volt"])
+
+    if res["watt"] is not None:
+        w = float(res["watt"])
+        res["watt_str"] = f"{w*1000:.0f} mW" if w < 1.0 else f"{w:.2f} W"
+    if res["volt"] is not None:
+        res["volt_str"] = f"{float(res['volt']):.2f} V"
+    if res["amp"] is not None:
+        res["amp_str"] = f"{float(res['amp']):.3f} A"
+
+    res["ok"] = True
+    return res
+
+
+# ==========================================================
+# NET LIVE DASHBOARD RUNNER
+# ==========================================================
+
+def run_net_live_dashboard(argv: list[str]) -> int:
+    """
+    Live ping graph — alternate screen, non-scrolling.
+    Mekanisme DNS sama dengan PingSampler di run_live_dashboard:
+    resolve SEKALI di awal, ping loop pakai IP langsung.
+
+    Options:
+      [target]       Target hostname atau IP (default: google.com)
+      --interval N   Ping interval detik (default: 1.0, min: 0.5)
+      --window  N    Jumlah sampel di sparkline (default: 60)
+    """
+    if psutil is None:
+        ansi.print_brief_error("Monitoring requires 'psutil' library.")
+        print("Install (Fedora): sudo dnf install python3-psutil")
+        return 1
+
+    # --- Parse args ---
+    target   = "google.com"
+    interval = 1.0
+    window   = 60
+
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--interval" and i + 1 < len(argv):
+            try:
+                interval = float(argv[i + 1])
+            except Exception:
+                pass
+            i += 1
+        elif a == "--window" and i + 1 < len(argv):
+            try:
+                window = int(argv[i + 1])
+            except Exception:
+                pass
+            i += 1
+        elif not a.startswith("--"):
+            target = a.strip() or target
+        i += 1
+
+    interval = float(clamp(interval, 0.5, 10.0))
+    window   = max(10, min(window, 300))
+
+    # --- Init PingSampler (DNS resolve sekali di sini) ---
+    ping = PingSampler(target=target, interval=interval)
+    ping.start()
+
+    from .render import draw_sparkline
+
+    ansi.alt_screen_enter()
+    ansi.cursor_hide()
+
+    import sys as _sys
+
+    try:
+        while True:
+            cols, _rows = ansi.term_size()
+            usable = min(cols, 96)
+
+            ping_ms  = ping.last_ms
+            ping_avg = ping.avg()
+            jit      = ping.jitter()
+            history  = list(ping.window)
+
+            ping_txt = "TIMEOUT" if ping_ms is None else f"{ping_ms:.1f} ms"
+            avg_txt  = "-"       if ping_avg is None else f"{ping_avg:.1f} ms"
+            jit_txt  = "-"       if jit      is None else f"{jit:.1f} ms"
+            pcol     = col_by_ping(ping_ms)
+
+            # Resolved IP — ditampilkan untuk transparansi
+            ip_txt = ping.resolved_ip or "?"
+            # Jika target sudah berupa IP, tidak perlu tampil duplikat
+            ip_label = (
+                f" {ansi.c_dim()}({ip_txt}){ansi.c_reset()}"
+                if ip_txt != target else ""
+            )
+
+            _out: list[str] = []
+            _ap = _out.append
+
+            _sys.stdout.write('\x1b[H\x1b[J')
+
+            ts = now_ts()
+            title_l = f"{ansi.c_cyan()}{ansi.c_bold()}AI MON{ansi.c_reset()} {ansi.c_dim()}• Net Live{ansi.c_reset()}"
+            title_r = f"{ansi.c_dim()}{ts}{ansi.c_reset()}"
+            _ap(align_lr(title_l, title_r, usable))
+
+            sep = f"{ansi.c_dim()}{ansi.hr(min(usable, 96))}{ansi.c_reset()}"
+            _ap(sep)
+
+            # Target + resolved IP
+            _ap(
+                f"{ansi.c_bold()}TARGET{ansi.c_reset()} "
+                f"{target}{ip_label}   "
+                f"{ansi.c_dim()}interval:{ansi.c_reset()} {interval:.1f}s   "
+                f"{ansi.c_dim()}window:{ansi.c_reset()} {window} samples"
+            )
+            _ap(sep)
+
+            # Live stats
+            _ap(
+                f"{ansi.c_bold()}LAST  {ansi.c_reset()} {pcol}{ping_txt}{ansi.c_reset()}"
+            )
+            _ap(
+                f"{ansi.c_bold()}AVG   {ansi.c_reset()} {ansi.c_dim()}{avg_txt}{ansi.c_reset()}   "
+                f"{ansi.c_bold()}JITTER{ansi.c_reset()} {ansi.c_dim()}{jit_txt}{ansi.c_reset()}"
+            )
+
+            _ap(sep)
+
+            # Sparkline graph
+            spark_w = min(usable - 4, 80)
+            spark_lines = draw_sparkline(history, width=spark_w, height=8)
+            valid = [v for v in history if v is not None]
+            if valid:
+                lo = min(valid)
+                hi = max(valid)
+                _ap(f"  {ansi.c_dim()}{hi:.0f} ms{ansi.c_reset()}")
+            else:
+                _ap(f"  {ansi.c_dim()}-- ms{ansi.c_reset()}")
+
+            for ln in spark_lines:
+                _ap(f"  {ansi.c_cyan()}{ln}{ansi.c_reset()}")
+
+            if valid:
+                _ap(f"  {ansi.c_dim()}{lo:.0f} ms{ansi.c_reset()}")
+            else:
+                _ap(f"  {ansi.c_dim()}-- ms{ansi.c_reset()}")
+
+            _ap(sep)
+            _ap(f"{ansi.c_dim()}Ctrl+C untuk keluar.{ansi.c_reset()}")
+
+            _sys.stdout.write('\n'.join(_out) + '\n')
+            _sys.stdout.flush()
+
+            time.sleep(interval)
+
+    except KeyboardInterrupt:
+        pass
+    except Exception as ex:
+        try:
+            ansi.cursor_show()
+            ansi.alt_screen_exit()
+        except Exception:
+            pass
+        ansi.print_brief_error(f"Net Live crash: {type(ex).__name__}: {ex}")
+        return 1
+    finally:
+        try:
+            ping.stop()
+        except Exception:
+            pass
+        try:
+            ansi.cursor_show()
+            ansi.alt_screen_exit()
+        except Exception:
+            pass
+
+    return 0
+
+
 # ==========================================================
 # MAIN DASHBOARD RUNNER
 # ==========================================================
@@ -723,6 +1361,7 @@ def run_live_dashboard(argv: list[str]) -> int:
     disk_io = DiskIOSampler(disk_dev) if disk_dev else None
 
     ping = PingSampler(target=target, interval=max(2.0, interval * 2.0))
+    thr = ThrottleReader()
     ping.start()
 
     # Throttling timers
@@ -779,13 +1418,24 @@ def run_live_dashboard(argv: list[str]) -> int:
                 if isinstance(maxwidth, int) and maxwidth > 40:
                     usable = min(usable, int(maxwidth))
 
-                # Collect metrics
-                cpu = get_cpu_percent()
-                ram_pct, ram_used, ram_total = get_memory_info()
-                swap = get_swap_info()
-                temps = read_temperatures()
-                fan_rpm = read_fan_rpm()
-                power = read_power()
+                # Core metrics - direct psutil calls (sama persis dengan original)
+                try:
+                    cpu = float(psutil.cpu_percent(interval=None))
+                except Exception:
+                    cpu = 0.0
+
+                try:
+                    vm = psutil.virtual_memory()
+                    ram_pct = float(vm.percent)
+                    ram_used = float(vm.used)
+                    ram_total = float(vm.total)
+                except Exception:
+                    ram_pct, ram_used, ram_total = 0.0, 0.0, 0.0
+
+                swap = _swap_read()
+                temps = _read_key_temps()
+                fan_rpm = _read_fan_rpm()
+                power = _read_power()
                 wifi = WiFiReader.read()
 
                 ns.update()
@@ -912,26 +1562,32 @@ def run_live_dashboard(argv: list[str]) -> int:
                     last_snap = time.time()
 
                 # === RENDER START ===
-                ansi.clear_screen()
+                # === SINGLE-WRITE RENDER (smooth, no flicker) ===
+                import sys as _sys
+                _out: list[str] = []
+                _ap = _out.append
+
+                # Move cursor home + erase below (no blank flash)
+                _sys.stdout.write('\x1b[H\x1b[J')
 
                 # Header
                 ts = now_ts()
                 title_left = f"{ansi.c_cyan()}{ansi.c_bold()}AI MON{ansi.c_reset()} {ansi.c_dim()}• Live Cockpit{ansi.c_reset()}"
                 title_right = f"{ansi.c_dim()}{ts}{ansi.c_reset()}"
-                print(align_lr(title_left, title_right, usable))
+                _ap(align_lr(title_left, title_right, usable))
 
                 sep = f"{ansi.c_dim()}{ansi.hr(min(usable, 96))}{ansi.c_reset()}"
 
                 # System info lines
                 left_sys = f"{ansi.c_dim()}Host:{ansi.c_reset()} {host}  {ansi.c_dim()}OS:{ansi.c_reset()} {distro or '-'}"
                 right_sys = f"{ansi.c_dim()}Kernel:{ansi.c_reset()} {kernel}"
-                print(align_lr(left_sys, right_sys, usable))
+                _ap(align_lr(left_sys, right_sys, usable))
 
                 cpu_count = os.cpu_count() or 1
                 uptime = get_uptime_str()
                 left_run = f"{ansi.c_dim()}Uptime:{ansi.c_reset()} {uptime}  {ansi.c_dim()}CPUs:{ansi.c_reset()} {cpu_count}"
                 right_run = f"{ansi.c_dim()}Interval:{ansi.c_reset()} {interval:.1f}s  {ansi.c_dim()}Target:{ansi.c_reset()} {target}"
-                print(align_lr(left_run, right_run, usable))
+                _ap(align_lr(left_run, right_run, usable))
 
                 # Load average
                 la1, la5, la15 = get_loadavg()
@@ -941,41 +1597,41 @@ def run_live_dashboard(argv: list[str]) -> int:
 
                 left_load = f"{ansi.c_dim()}Load avg (1m/5m/15m):{ansi.c_reset()} {la1:.2f}/{la5:.2f}/{la15:.2f}"
                 right_load = f"{ansi.c_dim()}Load/CPU:{ansi.c_reset()} {per1:.2f}/{per5:.2f}/{per15:.2f}"
-                print(align_lr(left_load, right_load, usable))
+                _ap(align_lr(left_load, right_load, usable))
 
-                print(sep)
+                _ap(sep)
 
                 # System metrics
-                print(f"{ansi.c_bold()} CPU {ansi.c_reset()} {draw_bar(cpu)} {cpu:>5.1f}%   {ansi.c_dim()}Freq:{ansi.c_reset()} {cpu_freq_str}")
-                print(f"{ansi.c_bold()} RAM {ansi.c_reset()} {draw_bar(ram_pct)} {ram_pct:>5.1f}%   {ram_used/(1024**3):.1f}/{ram_total/(1024**3):.1f} GiB")
+                _ap(f"{ansi.c_bold()} CPU {ansi.c_reset()} {draw_bar(cpu)} {cpu:>5.1f}%   {ansi.c_dim()}Freq:{ansi.c_reset()} {cpu_freq_str}")
+                _ap(f"{ansi.c_bold()} RAM {ansi.c_reset()} {draw_bar(ram_pct)} {ram_pct:>5.1f}%   {ram_used/(1024**3):.1f}/{ram_total/(1024**3):.1f} GiB")
 
                 if swap.get("ok") and swap.get("total", 0) > 0:
                     sw_pct = float(swap.get("pct", 0.0))
                     sw_used = int(swap.get("used", 0))
                     sw_total = int(swap.get("total", 0))
-                    print(f"{ansi.c_bold()}SWAP {ansi.c_reset()} {draw_bar(sw_pct)} {sw_pct:>5.1f}%   {human_bytes(sw_used)}/{human_bytes(sw_total)}")
+                    _ap(f"{ansi.c_bold()}SWAP {ansi.c_reset()} {draw_bar(sw_pct)} {sw_pct:>5.1f}%   {human_bytes(sw_used)}/{human_bytes(sw_total)}")
                 else:
-                    print(f"{ansi.c_bold()}SWAP {ansi.c_reset()} {ansi.c_dim()}(not available){ansi.c_reset()}")
+                    _ap(f"{ansi.c_bold()}SWAP {ansi.c_reset()} {ansi.c_dim()}(not available){ansi.c_reset()}")
 
                 if disk_io and disk_dev:
                     util = float(disk_io.active_pct)
                     col_u = ansi.c_green() if util <= 60 else (ansi.c_yellow() if util <= 85 else ansi.c_red())
                     r = human_rate_bps(disk_io.read_bps)
                     w = human_rate_bps(disk_io.write_bps)
-                    print(f"{ansi.c_bold()} I/O {ansi.c_reset()} {col_u}{util:>5.1f}%{ansi.c_reset()}  R:{r:<11}  W:{w:<11}  {ansi.c_dim()}({disk_dev}){ansi.c_reset()}")
+                    _ap(f"{ansi.c_bold()} I/O {ansi.c_reset()} {col_u}{util:>5.1f}%{ansi.c_reset()}  R:{r:<11}  W:{w:<11}  {ansi.c_dim()}({disk_dev}){ansi.c_reset()}")
 
-                print(sep)
+                _ap(sep)
 
                 # Top processes
-                print(f"{ansi.c_bold()}Top CPU (1–3){ansi.c_reset()}")
+                _ap(f"{ansi.c_bold()}Top CPU (1–3){ansi.c_reset()}")
                 for ln in top_cpu_rows:
-                    print(ln)
-                print("")
-                print(f"{ansi.c_bold()}Top MEM (1–3){ansi.c_reset()}")
+                    _ap(ln)
+                _ap("")
+                _ap(f"{ansi.c_bold()}Top MEM (1–3){ansi.c_reset()}")
                 for ln in top_mem_rows:
-                    print(ln)
+                    _ap(ln)
 
-                print(sep)
+                _ap(sep)
 
                 # Temperatures & Fan
                 cpu_t = temps.get("cpu")
@@ -988,7 +1644,7 @@ def run_live_dashboard(argv: list[str]) -> int:
 
                 fan_s = _fan_label(int(fan_rpm) if isinstance(fan_rpm, (int, float)) else None)
 
-                print(
+                _ap(
                     f"{ansi.c_bold()}TEMP {ansi.c_reset()}"
                     f"CPU:{col_by_temp(cpu_t)}{cpu_t_s}{ansi.c_reset()}   "
                     f"NVMe:{col_by_temp(ssd_t)}{ssd_t_s}{ansi.c_reset()}   "
@@ -996,16 +1652,34 @@ def run_live_dashboard(argv: list[str]) -> int:
                     f"{ansi.c_dim()}Fan:{ansi.c_reset()} {fan_s}"
                 )
 
+                # Throttle
+                th = thr.read()
+                if th.get("ok"):
+                    if th.get("active"):
+                        dc = th.get("delta_core")
+                        dp = th.get("delta_pkg")
+                        parts = []
+                        if isinstance(dc, int) and dc > 0:
+                            parts.append(f"+core {dc}")
+                        if isinstance(dp, int) and dp > 0:
+                            parts.append(f"+pkg {dp}")
+                        extra = f" {ansi.c_dim()}({', '.join(parts)}){ansi.c_reset()}" if parts else ""
+                        _ap(f"{ansi.c_bold()}THROT{ansi.c_reset()} {ansi.c_red()}ACTIVE{ansi.c_reset()}{extra}")
+                    else:
+                        _ap(f"{ansi.c_bold()}THROT{ansi.c_reset()} {ansi.c_green()}OK{ansi.c_reset()}")
+                else:
+                    _ap(f"{ansi.c_bold()}THROT{ansi.c_reset()} {ansi.c_dim()}N/A{ansi.c_reset()}")
+
                 # Power
                 lvl_txt = f"{lvl_i}%" if isinstance(lvl_i, int) else "?"
-                print(
+                _ap(
                     f"{ansi.c_bold()}POWER{ansi.c_reset()} "
                     f"{bat_col}{lvl_txt}{ansi.c_reset()} [{st_txt}]   "
                     f"{ansi.c_yellow()}{power.get('watt_str','N/A')}{ansi.c_reset()} @ {power.get('volt_str','N/A')} | {power.get('amp_str','N/A')}   "
                     f"{ansi.c_dim()}{eta}{ansi.c_reset()}"
                 )
 
-                print(sep)
+                _ap(sep)
 
                 # Network
                 rx = human_rate_bps(ns.rx)
@@ -1023,33 +1697,41 @@ def run_live_dashboard(argv: list[str]) -> int:
                 wifi_sig = wifi.get("signal_dbm") if wifi.get("ok") else None
                 q_lbl, q_col = _net_quality(ping_avg, jit, wifi_sig if isinstance(wifi_sig, (int, float)) else None)
 
-                print(
+                _ap(
                     f"{ansi.c_bold()}NET  {ansi.c_reset()}↓{rx}  ↑{tx}   "
                     f"Quality:{q_col}{q_lbl}{ansi.c_reset()}"
                 )
 
-                ping_line = (
-                    f"{ansi.c_bold()}PING {ansi.c_reset()}{target}   "
-                    f"last:{pcol}{ping_txt}{ansi.c_reset()}  "
-                    f"avg:{ansi.c_dim()}{avg_txt}{ansi.c_reset()}  "
+                # Baris 1: label + target + resolved IP
+                _ap(
+                    f"{ansi.c_bold()}PING {ansi.c_reset()}"
+                    f"{target}{ansi.c_dim()} ({ping.resolved_ip or '?'}){ansi.c_reset()}"
+                )
+                # Baris 2: last / avg / jitter
+                _ap(
+                    f"     "
+                    f"last:{pcol}{ping_txt}{ansi.c_reset()}   "
+                    f"avg:{ansi.c_dim()}{avg_txt}{ansi.c_reset()}   "
                     f"jitter:{ansi.c_dim()}{jit_txt}{ansi.c_reset()}"
                 )
-
+                # Baris 3: WiFi (opsional, hanya tampil jika tersedia)
                 if wifi.get("ok"):
                     ssid = wifi.get("ssid") or "-"
                     sig = wifi.get("signal_dbm")
                     sig_txt = f"{sig:.0f} dBm" if isinstance(sig, (int, float)) else "-"
-                    ping_line += f"   {ansi.c_dim()}WiFi:{ansi.c_reset()} {trim_name(ssid, 14)} ({col_by_dbm(sig)}{sig_txt}{ansi.c_reset()})"
-
-                print(ping_line)
+                    _ap(
+                        f"     "
+                        f"{ansi.c_dim()}WiFi:{ansi.c_reset()} {trim_name(ssid, 20)}"
+                        f"   {col_by_dbm(sig)}{sig_txt}{ansi.c_reset()}"
+                    )
 
                 # Disks
                 if show_disks:
-                    print(sep)
-                    print(f"{ansi.c_bold()}DISKS{ansi.c_reset()} {ansi.c_dim()}(mounted partitions){ansi.c_reset()}")
+                    _ap(sep)
+                    _ap(f"{ansi.c_bold()}DISKS{ansi.c_reset()} {ansi.c_dim()}(mounted partitions){ansi.c_reset()}")
 
                     if not disk_cache:
-                        print(f"  {ansi.c_dim()}(no mounted disks found){ansi.c_reset()}")
+                        _ap(f"  {ansi.c_dim()}(no mounted disks found){ansi.c_reset()}")
                     else:
                         name_w = 6
                         free_w = 9
@@ -1070,7 +1752,7 @@ def run_live_dashboard(argv: list[str]) -> int:
                                 f"MOUNT"
                                 f"{ansi.c_reset()}"
                             )
-                            print(hdr)
+                            _ap(hdr)
 
                         for d in disk_cache:
                             pct = float(d.get("pct", 0.0))
@@ -1095,7 +1777,7 @@ def run_live_dashboard(argv: list[str]) -> int:
                                 f"{used_disp:<{used_w}} | "
                                 f"({mp_disp})"
                             )
-                            print(line)
+                            _ap(line)
 
                 # Footer
                 if not compact:
@@ -1108,15 +1790,20 @@ def run_live_dashboard(argv: list[str]) -> int:
                         import textwrap
                         footer = " | ".join(hw_parts)
                         for ln in textwrap.wrap(footer, width=min(usable, 92)):
-                            print(f"{ansi.c_dim()}{ln}{ansi.c_reset()}")
+                            _ap(f"{ansi.c_dim()}{ln}{ansi.c_reset()}")
 
-                print("")
+                _ap("")
                 if compact:
-                    print(f"{ansi.c_dim()}Ctrl+C untuk keluar. Tip: ai mon sensors{ansi.c_reset()}")
+                    _ap(f"{ansi.c_dim()}Ctrl+C untuk keluar. Tip: ai mon sensors{ansi.c_reset()}")
                 else:
-                    print(f"{ansi.c_dim()}Ctrl+C untuk keluar.{ansi.c_reset()}  {ansi.c_dim()}Tip:{ansi.c_reset()} `ai mon sensors` untuk daftar sensor lengkap.")
-                    print(f"{ansi.c_dim()}Tip:{ansi.c_reset()} `sudo ai mon disk` untuk TBW/SMART detail.")
-                    print(f"{ansi.c_dim()}Tip:{ansi.c_reset()} `ai mon help` untuk opsi `--disk` dan tuning layout.")
+                    _ap(f"{ansi.c_dim()}Ctrl+C untuk keluar.{ansi.c_reset()}  {ansi.c_dim()}Tip:{ansi.c_reset()} `ai mon sensors` untuk daftar sensor lengkap.")
+                    _ap(f"{ansi.c_dim()}Tip:{ansi.c_reset()} `sudo ai mon disk` untuk TBW/SMART detail.")
+                    _ap(f"{ansi.c_dim()}Tip:{ansi.c_reset()} `ai mon help` untuk opsi `--disk` dan tuning layout.")
+
+
+                # Write all at once + flush
+                _sys.stdout.write('\n'.join(_out) + '\n')
+                _sys.stdout.flush()
 
                 time.sleep(interval)
 

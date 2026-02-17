@@ -8,6 +8,7 @@ from system_logic.terminal import ansi
 # REMOVED: from . import const  # ← Circular import!
 from .ui import (
     run_live_dashboard,
+    run_net_live_dashboard,
     run_battery_report,
     run_disk_report,
     run_network_diag,
@@ -137,8 +138,9 @@ def _print_help():
 def _run_net_live(args: List[str]) -> int:
     """
     Run live ping graph (alternate screen, non-scrolling).
-    TODO: Implement if needed, or merge into dashboard.
+    DNS resolve sekali di awal via PingSampler — mekanisme selaras
+    dengan ai mon live. Ping loop berikutnya langsung ke IP.
+
+    Usage: ai mon net live [target] [--interval N] [--window N]
     """
-    ansi.print_brief_error("net live: Not yet implemented in refactor")
-    print("Use: ai mon live --target <host>")
-    return 1
+    return run_net_live_dashboard(args)
