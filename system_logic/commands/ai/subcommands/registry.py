@@ -12,12 +12,12 @@ from typing import Any
 # Daftar folder subcommand yang diharapkan ada.
 # Tambahkan nama folder baru di sini jika membuat fitur baru.
 TARGET_SUBCOMMANDS = [
-    "run",      # Priority: High (Refactored)
-    "help",     # Core
-    "status",   # Core
-    "mon",      # Pending Refactor
-    "gitx",     # Pending Refactor
-    "ghx",      # Pending Refactor
+    "run",      # core + AI run features
+    "help",     # Core help (built-in)
+    "status",   # Core + AI status
+    "mon",      # core + monitoring features
+    "gitx",     # core + git features
+    "ghx",      # pending (GitHub CLI)
 ]
 
 COMMANDS: dict[str, Any] = {}
