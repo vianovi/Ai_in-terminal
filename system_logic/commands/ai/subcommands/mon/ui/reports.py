@@ -20,6 +20,11 @@ from system_logic.core.storage import (
 from ..storage import get_comparison_text, list_metric_dates
 from ..utils import human_bytes
 
+# NEW IMPORTS for net live dashboard
+from .render import align_columns
+from ..collectors.network import PingMonitor, collect_network_stats, collect_wifi_stats
+from ..utils import col_by_ping, col_by_dbm, run_cmd
+
 
 def run_battery_report(args: List[str]) -> int:
     """Generate battery health report dengan history."""
@@ -149,7 +154,7 @@ def run_disk_report(args: List[str]) -> int:
             codeI, outI = _sh(f"sudo {cmdI}")
 
         if not outA and not outH:
-            print(f"  Health        : {ansi.c_yellow()}N/A ⚠{ansi.c_reset()}  {ansi.c_dim()}(smartctl tidak memberi output){ansi.c_reset()}")
+            print(f"  Health        : {ansi.c_yellow()}N/A ⚠ {ansi.c_reset()}  {ansi.c_dim()}(smartctl tidak memberi output){ansi.c_reset()}")
             continue
 
         parsed = _parse_smart_health(outA, outH)
@@ -249,7 +254,7 @@ def run_sensors_dump() -> int:
     try:
         import psutil
     except ImportError:
-        ansi.print_brief_error("psutil belum terpasang — MON tidak bisa jalan tanpa ini.")
+        ansi.print_brief_error("psutil belum terpasang – MON tidak bisa jalan tanpa ini.")
         print("Install Fedora: sudo dnf install python3-psutil")
         return 1
 
@@ -321,6 +326,447 @@ def run_sensors_dump() -> int:
     return 0
 
 
+def run_net_live_dashboard(args: list[str]) -> int:
+    """
+    Live ping monitoring dengan WiFi stats lengkap.
+
+    Usage: ai mon net live [target] [--interval N] [--window N]
+    """
+    try:
+        import psutil
+    except ImportError:
+        ansi.print_brief_error("Fitur monitoring butuh library 'psutil'.")
+        print("Install (Fedora): sudo dnf install python3-psutil")
+        return 1
+
+    import sys
+    import time
+
+    # Parse arguments
+    target = "google.com"
+    interval = 1.0
+    window = 60
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("--interval", "-i") and i + 1 < len(args):
+            try:
+                interval = max(0.2, min(5.0, float(args[i + 1])))
+            except ValueError:
+                pass
+            i += 2
+        elif arg in ("--window", "-w") and i + 1 < len(args):
+            try:
+                window = max(20, min(300, int(args[i + 1])))
+            except ValueError:
+                pass
+            i += 2
+        elif not arg.startswith("-"):
+            target = arg.strip()
+            i += 1
+        else:
+            i += 1
+
+    # Initialize monitoring
+    ping = PingMonitor(target=target, window=window)
+    ping.start()
+
+    # Network speed tracker
+    class _NetSpeed:
+        def __init__(self):
+            self.rx = 0.0
+            self.tx = 0.0
+            self.prev = None
+            self.prev_time = time.time()
+
+        def update(self):
+            stats = collect_network_stats()
+            if not stats.get('ok'):
+                return
+            curr_time = time.time()
+            dt = curr_time - self.prev_time
+            if dt <= 0:
+                return
+            rx = stats.get('bytes_recv', 0)
+            tx = stats.get('bytes_sent', 0)
+            if self.prev:
+                self.rx = (rx - self.prev[0]) / dt
+                self.tx = (tx - self.prev[1]) / dt
+            self.prev = (rx, tx)
+            self.prev_time = curr_time
+
+    ns = _NetSpeed()
+
+    # Alt screen
+    ansi.alt_screen_enter()
+    ansi.cursor_hide()
+    input_muter = ansi.MuteInputDuringWait()
+
+    try:
+        with input_muter:
+            while True:
+                cols, _ = ansi.term_size()
+                w = min(cols, 120)
+
+                # Get stats
+                stats = ping.get_stats()
+                wifi = _get_full_wifi_stats()
+                ns.update()
+
+                # Build output
+                out = []
+                sep = "─" * w
+
+                # Header
+                now = time.strftime("%A | %H:%M:%S")
+                hdr = f"{ansi.c_cyan()}{ansi.c_bold()}AI MON {ansi.c_dim()}•{ansi.c_reset()} {ansi.c_cyan()}{ansi.c_bold()}NET LIVE{ansi.c_reset()}"
+                out.append(align_columns(hdr, f"{ansi.c_dim()}{now}{ansi.c_reset()}", w))
+                out.append(sep)
+
+                # Target
+                ip = stats.get('resolved_ip', target)
+                tgt = f"{ansi.c_bold()}TARGET{ansi.c_reset()}  {target}"
+                if ip != target:
+                    tgt += f" {ansi.c_dim()}({ip}){ansi.c_reset()}"
+                out.append(tgt)
+
+                # Config
+                cfg = f"{ansi.c_bold()}CONFIG{ansi.c_reset()}  interval: {interval}s    window: {window} samples"
+                out.append(cfg)
+                out.append(sep)
+
+                # WiFi stats
+                if wifi.get('ok'):
+                    ssid = wifi.get('ssid', '?')
+                    sig = wifi.get('signal_dbm')
+                    sig_s = f"{sig:.0f} dBm" if sig else "N/A"
+                    sig_c = col_by_dbm(sig) if sig else ansi.c_dim()
+                    ch = wifi.get('channel_info', '')
+                    temp = wifi.get('temperature')
+                    temp_s = f"{ansi.c_dim()}Temp: {temp}°C{ansi.c_reset()}" if temp else ""
+
+                    # Line 1: SSID + Signal + Channel
+                    w1 = f"{ansi.c_bold()}WiFi{ansi.c_reset()}    {ssid} {sig_c}({sig_s}){ansi.c_reset()}  {ch}"
+                    out.append(align_columns(w1, temp_s, w))
+
+                    # Line 2: Link speeds
+                    tx_r = wifi.get('tx_bitrate', 'N/A')
+                    rx_r = wifi.get('rx_bitrate', 'N/A')
+                    qual = wifi.get('quality')
+                    qual_s = f"{ansi.c_dim()}Quality: {qual}%{ansi.c_reset()}" if qual else ""
+                    lnk = f"{ansi.c_bold()}Link{ansi.c_reset()}    TX {ansi.c_green()}{tx_r}{ansi.c_reset()}  RX {ansi.c_green()}{rx_r}{ansi.c_reset()}"
+                    out.append(align_columns(lnk, qual_s, w))
+
+                    # Line 3: Traffic
+                    rx_bps = _format_bitrate(ns.rx * 8)
+                    tx_bps = _format_bitrate(ns.tx * 8)
+                    beacon = wifi.get('beacon_loss')
+                    beacon_s = f"{ansi.c_dim()}Beacon loss: {beacon}{ansi.c_reset()}" if beacon is not None and beacon >= 0 else ""
+                    trf = f"{ansi.c_bold()}Traffic{ansi.c_reset()} ↓ {ansi.c_cyan()}{rx_bps}{ansi.c_reset()}    ↑ {ansi.c_yellow()}{tx_bps}{ansi.c_reset()}"
+                    out.append(align_columns(trf, beacon_s, w))
+
+                    out.append(sep)
+
+                # Ping stats
+                last = stats.get('last_ping')
+                avg = stats.get('avg_ping')
+                jitter = stats.get('jitter')
+                loss = stats.get('loss_pct', 0.0)
+
+                last_s = f"{last:.0f}ms" if last else "TO"
+                avg_s = f"{avg:.0f}ms" if avg else "N/A"
+                jit_s = f"{jitter:.0f}ms" if jitter else "N/A"
+                loss_s = f"{loss:.0f}%"
+
+                last_c = col_by_ping(last) if last else ansi.c_red()
+                avg_c = col_by_ping(avg) if avg else ansi.c_dim()
+
+                if jitter and jitter < 10:
+                    jit_c = ansi.c_green()
+                elif jitter and jitter < 50:
+                    jit_c = ansi.c_yellow()
+                else:
+                    jit_c = ansi.c_red()
+
+                if loss < 1:
+                    loss_c = ansi.c_green()
+                elif loss < 5:
+                    loss_c = ansi.c_yellow()
+                else:
+                    loss_c = ansi.c_red()
+
+                ping_line = (
+                    f"{ansi.c_bold()}PING{ansi.c_reset()}    "
+                    f"LAST {last_c}{last_s}{ansi.c_reset()}    "
+                    f"AVG {avg_c}{avg_s}{ansi.c_reset()}    "
+                    f"JITTER {jit_c}{jit_s}{ansi.c_reset()}    "
+                    f"LOSS {loss_c}{loss_s}{ansi.c_reset()}"
+                )
+                out.append(ping_line)
+                out.append(sep)
+
+                # Graph
+                history = stats.get('history', [])
+                graph_lines = _draw_ping_graph(history, w)
+                out.extend(graph_lines)
+
+                # Legend
+                legend = (
+                    f"{ansi.c_green()}●{ansi.c_reset()} 0-50ms  "
+                    f"{ansi.c_cyan()}●{ansi.c_reset()} 50-100ms  "
+                    f"{ansi.c_yellow()}●{ansi.c_reset()} 100-200ms  "
+                    f"{ansi.c_red()}●{ansi.c_reset()} >200ms  "
+                    f"{ansi.c_red()}{ansi.c_bold()}×{ansi.c_reset()} timeout"
+                )
+                out.append(f"Legend: {legend}")
+                out.append(sep)
+
+                # Footer
+                tip = f"{ansi.c_dim()}Ctrl+C untuk keluar.   Tip: 'ai mon net {target}' untuk diagnosis (dns + wifi).{ansi.c_reset()}"
+                out.append(tip)
+
+                # Render
+                sys.stdout.write('\x1b[H\x1b[J')
+                sys.stdout.write('\n'.join(out) + '\n')
+                sys.stdout.flush()
+
+                time.sleep(interval)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ping.stop()
+        ansi.cursor_show()
+        ansi.alt_screen_exit()
+
+    return 0
+
+
+def _get_full_wifi_stats() -> dict:
+    """Get comprehensive WiFi stats via iw commands."""
+    result = {
+        'ok': False,
+        'ssid': None,
+        'signal_dbm': None,
+        'tx_bitrate': 'N/A',
+        'rx_bitrate': 'N/A',
+        'channel_info': '',
+        'quality': None,
+        'temperature': None,
+        'beacon_loss': None
+    }
+
+    # Get interface
+    rc, out = run_cmd(["iw", "dev"], timeout=2)
+    iface = None
+    if rc == 0:
+        for line in out.split('\n'):
+            if 'Interface' in line:
+                parts = line.strip().split()
+                if len(parts) >= 2:
+                    iface = parts[1]
+                    break
+
+    if not iface:
+        return result
+
+    result['ok'] = True
+
+    # Get link info (signal, SSID)
+    rc, out = run_cmd(["iw", "dev", iface, "link"], timeout=2)
+    if rc == 0:
+        for line in out.split('\n'):
+            line = line.strip()
+            if line.startswith('SSID:'):
+                result['ssid'] = line.split(':', 1)[1].strip()
+            elif 'signal:' in line:
+                parts = line.split()
+                for i, part in enumerate(parts):
+                    if part == 'signal:' and i + 1 < len(parts):
+                        try:
+                            result['signal_dbm'] = float(parts[i + 1])
+                        except ValueError:
+                            pass
+
+    # Get station dump (TX/RX bitrate, beacon loss)
+    rc, out = run_cmd(["iw", "dev", iface, "station", "dump"], timeout=2)
+    if rc == 0:
+        for line in out.split('\n'):
+            line = line.strip()
+            if line.startswith('rx bitrate:'):
+                result['rx_bitrate'] = line.split(':', 1)[1].strip()
+            elif line.startswith('tx bitrate:'):
+                result['tx_bitrate'] = line.split(':', 1)[1].strip()
+            elif line.startswith('beacon loss:'):
+                try:
+                    result['beacon_loss'] = int(line.split(':', 1)[1].strip())
+                except ValueError:
+                    pass
+
+    # Get channel info
+    rc, out = run_cmd(["iw", "dev", iface, "info"], timeout=2)
+    if rc == 0:
+        channel = None
+        freq = None
+        width = None
+        for line in out.split('\n'):
+            line = line.strip()
+            if line.startswith('channel'):
+                parts = line.split()
+                if len(parts) >= 2:
+                    channel = parts[1]
+            elif 'MHz' in line and 'width:' in line:
+                if 'width:' in line:
+                    width_part = line.split('width:', 1)[1].strip()
+                    width = width_part.split()[0] + 'MHz'
+                if '(' in line and 'MHz)' in line:
+                    freq_str = line.split('(')[1].split('MHz')[0].strip()
+                    try:
+                        freq_mhz = int(freq_str)
+                        band = "5GHz" if freq_mhz >= 5000 else "2.4GHz"
+                        freq = band
+                    except ValueError:
+                        pass
+
+        if channel and freq:
+            result['channel_info'] = f"{ansi.c_dim()}{freq} Ch{channel}{ansi.c_reset()}"
+            if width:
+                result['channel_info'] += f"{ansi.c_dim()} {width}{ansi.c_reset()}"
+
+    # Get quality from /proc/net/wireless
+    try:
+        with open('/proc/net/wireless', 'r') as f:
+            lines = f.readlines()
+            for line in lines:
+                if iface in line:
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        qual_str = parts[2].rstrip('.')
+                        try:
+                            qual = float(qual_str)
+                            result['quality'] = int((qual / 70.0) * 100)
+                        except ValueError:
+                            pass
+    except Exception:
+        pass
+
+    # Get WiFi temperature (iwlwifi sensor)
+    try:
+        import psutil
+        temps = psutil.sensors_temperatures()
+        for key in temps:
+            if 'iwl' in key.lower() or 'ath' in key.lower():
+                entries = temps[key]
+                if entries:
+                    result['temperature'] = int(entries[0].current)
+                    break
+    except Exception:
+        pass
+
+    return result
+
+
+def _format_bitrate(bps: float) -> str:
+    """Format bitrate ke bps/Kbps/Mbps sesuai ukuran."""
+    if bps < 1000:
+        return f"{bps:.0f} bps"
+    elif bps < 1_000_000:
+        return f"{bps/1000:.1f} Kbps"
+    else:
+        return f"{bps/1_000_000:.1f} Mbps"
+
+
+def _draw_ping_graph(history: list, width: int) -> list[str]:
+    """Draw full-width ping graph dengan Y-axis dan colors."""
+    if not history:
+        return [f"{ansi.c_dim()}Waiting for data...{ansi.c_reset()}"]
+
+    # Calculate visible data
+    graph_width = width - 10  # Reserve for Y-axis labels
+    visible = history[-graph_width:] if len(history) > graph_width else history
+
+    # Get valid values for scaling
+    valid = [v for v in visible if v is not None]
+    if not valid:
+        return [f"{ansi.c_dim()}No valid pings yet...{ansi.c_reset()}"]
+
+    max_val = max(valid)
+
+    # Dynamic scale
+    if max_val < 50:
+        scale_max = 50
+    elif max_val < 100:
+        scale_max = 100
+    elif max_val < 200:
+        scale_max = 200
+    else:
+        scale_max = int((max_val + 99) // 100 * 100)
+
+    # Y-axis levels
+    levels = [scale_max, scale_max*3//4, scale_max//2, scale_max//4, 0]
+    graph_height = 6
+
+    lines = []
+
+    # Draw graph rows
+    for row in range(graph_height):
+        # Y-axis label
+        level_idx = row * len(levels) // graph_height
+        if level_idx < len(levels):
+            label = f"{levels[level_idx]:>4.0f}ms"
+        else:
+            label = "     "
+
+        # Line character
+        if row == 0:
+            line_char = '┤'
+        elif row == graph_height - 1:
+            line_char = '└'
+        else:
+            line_char = '│'
+
+        row_str = f"{label} {line_char}"
+
+        # Add data points
+        for val in visible:
+            if val is None:
+                # Timeout marker
+                row_str += f"{ansi.c_red()}{ansi.c_bold()}×{ansi.c_reset()}"
+            else:
+                # Calculate position
+                ratio = val / scale_max if scale_max > 0 else 0
+                ratio = max(0.0, min(1.0, ratio))
+                point_row = int((1.0 - ratio) * (graph_height - 1))
+
+                if point_row == row:
+                    # Color by value
+                    if val < 50:
+                        col = ansi.c_green()
+                    elif val < 100:
+                        col = ansi.c_cyan()
+                    elif val < 200:
+                        col = ansi.c_yellow()
+                    else:
+                        col = ansi.c_red()
+                    row_str += f"{col}●{ansi.c_reset()}"
+                else:
+                    row_str += " "
+
+        lines.append(row_str)
+
+    # X-axis
+    x_axis = "   0ms " + '└' + '─' * graph_width
+    lines.append(x_axis)
+
+    # Time label
+    mid_space = max(0, (graph_width - 30) // 2)
+    time_label = " " * 7 + "◄" + "─" * mid_space + " TIME (oldest ← newest) " + "─" * mid_space + "►"
+    lines.append(time_label[:width])
+
+    return lines
+
+
 # Helper functions
 def _lsblk_disks() -> list[dict[str, str]]:
     """Get disk list via lsblk."""
@@ -365,7 +811,6 @@ def _lsblk_disks() -> list[dict[str, str]]:
 
 def _parse_smart_health(smart_a: str, smart_h: str) -> dict:
     """Parse smartctl output."""
-    import os
     out: dict = {
         "health_text": "Unknown",
         "health_color": ansi.c_dim(),

@@ -8,6 +8,7 @@ MON Live Dashboard - COMPLETE FIXED VERSION
 from __future__ import annotations
 
 import os
+import sys
 import time
 import shutil
 import socket
@@ -31,7 +32,7 @@ from system_logic.core.storage import (
 from ..config import load_config
 from ..collectors.system import collect_system_stats
 from ..collectors.hardware import collect_hardware_stats, collect_battery_stats
-from ..collectors.network import collect_network_stats, collect_wifi_stats
+from ..collectors.network import collect_network_stats, collect_wifi_stats, PingMonitor
 from ..collectors.process import collect_process_stats
 
 from ..utils import (
@@ -422,27 +423,14 @@ class PingSampler:
     """
     Background ping sampler.
     Self-contained, persis dari mon.py asli - tidak memakai PingMonitor.
-
-    DNS Optimization: Resolve hostname SEKALI di __init__, ping berikutnya
-    langsung ke IP — tidak ada DNS lookup berulang di setiap interval.
-    Mekanisme ini selaras dengan PingMonitor di collectors/network.py.
     """
     def __init__(self, target: str, interval: float = 5.0) -> None:
-        self.target = target          # Hostname asli (untuk display)
+        self.target = target
         self.interval = float(clamp(interval, 1.0, 30.0))
         self.last_ms: Optional[float] = None
         self.window: deque = deque(maxlen=20)
         self._stop = threading.Event()
         self._thr = threading.Thread(target=self._run, daemon=True)
-
-        # DNS Pre-resolve: resolve SEKALI, simpan IP-nya.
-        # Ping loop berikutnya pakai self.resolved_ip — kernel tidak perlu
-        # tanya DNS resolver lagi. Jika DNS mati di tengah jalan, ping tetap jalan.
-        self.resolved_ip: Optional[str] = None
-        try:
-            self.resolved_ip = socket.gethostbyname(target)
-        except socket.gaierror:
-            self.resolved_ip = target  # Fallback: target sudah berupa IP
 
     def start(self) -> None:
         """Start background ping thread."""
@@ -466,18 +454,12 @@ class PingSampler:
         return max(self.window) - min(self.window)
 
     def _ping_once(self) -> Optional[float]:
-        """
-        Single ping ke resolved_ip (bukan hostname) — return ms atau None.
-        Menggunakan IP langsung: kernel tidak perlu DNS lookup per iterasi.
-        """
+        """Single ping, return ms atau None."""
         if not shutil.which("ping"):
             return None
-        # Gunakan resolved_ip (IP address), bukan self.target (hostname).
-        # Ini memastikan zero DNS overhead di setiap ping call.
-        ping_target = self.resolved_ip if self.resolved_ip else self.target
         try:
             out = subprocess.check_output(
-                ["ping", "-c", "1", "-W", "1", ping_target],
+                ["ping", "-c", "1", "-W", "1", self.target],
                 stderr=subprocess.DEVNULL,
                 text=True,
                 timeout=2,
@@ -1136,171 +1118,6 @@ def _read_power() -> Dict[str, Any]:
 
 
 # ==========================================================
-# NET LIVE DASHBOARD RUNNER
-# ==========================================================
-
-def run_net_live_dashboard(argv: list[str]) -> int:
-    """
-    Live ping graph — alternate screen, non-scrolling.
-    Mekanisme DNS sama dengan PingSampler di run_live_dashboard:
-    resolve SEKALI di awal, ping loop pakai IP langsung.
-
-    Options:
-      [target]       Target hostname atau IP (default: google.com)
-      --interval N   Ping interval detik (default: 1.0, min: 0.5)
-      --window  N    Jumlah sampel di sparkline (default: 60)
-    """
-    if psutil is None:
-        ansi.print_brief_error("Monitoring requires 'psutil' library.")
-        print("Install (Fedora): sudo dnf install python3-psutil")
-        return 1
-
-    # --- Parse args ---
-    target   = "google.com"
-    interval = 1.0
-    window   = 60
-
-    i = 0
-    while i < len(argv):
-        a = argv[i]
-        if a == "--interval" and i + 1 < len(argv):
-            try:
-                interval = float(argv[i + 1])
-            except Exception:
-                pass
-            i += 1
-        elif a == "--window" and i + 1 < len(argv):
-            try:
-                window = int(argv[i + 1])
-            except Exception:
-                pass
-            i += 1
-        elif not a.startswith("--"):
-            target = a.strip() or target
-        i += 1
-
-    interval = float(clamp(interval, 0.5, 10.0))
-    window   = max(10, min(window, 300))
-
-    # --- Init PingSampler (DNS resolve sekali di sini) ---
-    ping = PingSampler(target=target, interval=interval)
-    ping.start()
-
-    from .render import draw_sparkline
-
-    ansi.alt_screen_enter()
-    ansi.cursor_hide()
-
-    import sys as _sys
-
-    try:
-        while True:
-            cols, _rows = ansi.term_size()
-            usable = min(cols, 96)
-
-            ping_ms  = ping.last_ms
-            ping_avg = ping.avg()
-            jit      = ping.jitter()
-            history  = list(ping.window)
-
-            ping_txt = "TIMEOUT" if ping_ms is None else f"{ping_ms:.1f} ms"
-            avg_txt  = "-"       if ping_avg is None else f"{ping_avg:.1f} ms"
-            jit_txt  = "-"       if jit      is None else f"{jit:.1f} ms"
-            pcol     = col_by_ping(ping_ms)
-
-            # Resolved IP — ditampilkan untuk transparansi
-            ip_txt = ping.resolved_ip or "?"
-            # Jika target sudah berupa IP, tidak perlu tampil duplikat
-            ip_label = (
-                f" {ansi.c_dim()}({ip_txt}){ansi.c_reset()}"
-                if ip_txt != target else ""
-            )
-
-            _out: list[str] = []
-            _ap = _out.append
-
-            _sys.stdout.write('\x1b[H\x1b[J')
-
-            ts = now_ts()
-            title_l = f"{ansi.c_cyan()}{ansi.c_bold()}AI MON{ansi.c_reset()} {ansi.c_dim()}• Net Live{ansi.c_reset()}"
-            title_r = f"{ansi.c_dim()}{ts}{ansi.c_reset()}"
-            _ap(align_lr(title_l, title_r, usable))
-
-            sep = f"{ansi.c_dim()}{ansi.hr(min(usable, 96))}{ansi.c_reset()}"
-            _ap(sep)
-
-            # Target + resolved IP
-            _ap(
-                f"{ansi.c_bold()}TARGET{ansi.c_reset()} "
-                f"{target}{ip_label}   "
-                f"{ansi.c_dim()}interval:{ansi.c_reset()} {interval:.1f}s   "
-                f"{ansi.c_dim()}window:{ansi.c_reset()} {window} samples"
-            )
-            _ap(sep)
-
-            # Live stats
-            _ap(
-                f"{ansi.c_bold()}LAST  {ansi.c_reset()} {pcol}{ping_txt}{ansi.c_reset()}"
-            )
-            _ap(
-                f"{ansi.c_bold()}AVG   {ansi.c_reset()} {ansi.c_dim()}{avg_txt}{ansi.c_reset()}   "
-                f"{ansi.c_bold()}JITTER{ansi.c_reset()} {ansi.c_dim()}{jit_txt}{ansi.c_reset()}"
-            )
-
-            _ap(sep)
-
-            # Sparkline graph
-            spark_w = min(usable - 4, 80)
-            spark_lines = draw_sparkline(history, width=spark_w, height=8)
-            valid = [v for v in history if v is not None]
-            if valid:
-                lo = min(valid)
-                hi = max(valid)
-                _ap(f"  {ansi.c_dim()}{hi:.0f} ms{ansi.c_reset()}")
-            else:
-                _ap(f"  {ansi.c_dim()}-- ms{ansi.c_reset()}")
-
-            for ln in spark_lines:
-                _ap(f"  {ansi.c_cyan()}{ln}{ansi.c_reset()}")
-
-            if valid:
-                _ap(f"  {ansi.c_dim()}{lo:.0f} ms{ansi.c_reset()}")
-            else:
-                _ap(f"  {ansi.c_dim()}-- ms{ansi.c_reset()}")
-
-            _ap(sep)
-            _ap(f"{ansi.c_dim()}Ctrl+C untuk keluar.{ansi.c_reset()}")
-
-            _sys.stdout.write('\n'.join(_out) + '\n')
-            _sys.stdout.flush()
-
-            time.sleep(interval)
-
-    except KeyboardInterrupt:
-        pass
-    except Exception as ex:
-        try:
-            ansi.cursor_show()
-            ansi.alt_screen_exit()
-        except Exception:
-            pass
-        ansi.print_brief_error(f"Net Live crash: {type(ex).__name__}: {ex}")
-        return 1
-    finally:
-        try:
-            ping.stop()
-        except Exception:
-            pass
-        try:
-            ansi.cursor_show()
-            ansi.alt_screen_exit()
-        except Exception:
-            pass
-
-    return 0
-
-
-# ==========================================================
 # MAIN DASHBOARD RUNNER
 # ==========================================================
 
@@ -1702,28 +1519,20 @@ def run_live_dashboard(argv: list[str]) -> int:
                     f"Quality:{q_col}{q_lbl}{ansi.c_reset()}"
                 )
 
-                # Baris 1: label + target + resolved IP
-                _ap(
-                    f"{ansi.c_bold()}PING {ansi.c_reset()}"
-                    f"{target}{ansi.c_dim()} ({ping.resolved_ip or '?'}){ansi.c_reset()}"
-                )
-                # Baris 2: last / avg / jitter
-                _ap(
-                    f"     "
-                    f"last:{pcol}{ping_txt}{ansi.c_reset()}   "
-                    f"avg:{ansi.c_dim()}{avg_txt}{ansi.c_reset()}   "
+                ping_line = (
+                    f"{ansi.c_bold()}PING {ansi.c_reset()}{target}   "
+                    f"last:{pcol}{ping_txt}{ansi.c_reset()}  "
+                    f"avg:{ansi.c_dim()}{avg_txt}{ansi.c_reset()}  "
                     f"jitter:{ansi.c_dim()}{jit_txt}{ansi.c_reset()}"
                 )
-                # Baris 3: WiFi (opsional, hanya tampil jika tersedia)
+
                 if wifi.get("ok"):
                     ssid = wifi.get("ssid") or "-"
                     sig = wifi.get("signal_dbm")
                     sig_txt = f"{sig:.0f} dBm" if isinstance(sig, (int, float)) else "-"
-                    _ap(
-                        f"     "
-                        f"{ansi.c_dim()}WiFi:{ansi.c_reset()} {trim_name(ssid, 20)}"
-                        f"   {col_by_dbm(sig)}{sig_txt}{ansi.c_reset()}"
-                    )
+                    ping_line += f"   {ansi.c_dim()}WiFi:{ansi.c_reset()} {trim_name(ssid, 14)} ({col_by_dbm(sig)}{sig_txt}{ansi.c_reset()})"
+
+                _ap(ping_line)
 
                 # Disks
                 if show_disks:
@@ -1830,3 +1639,385 @@ def run_live_dashboard(argv: list[str]) -> int:
             pass
 
     return 0
+
+
+# ==========================================================
+# NET LIVE DASHBOARD (Ping Graph + WiFi Stats)
+# ==========================================================
+
+def run_net_live_dashboard(args: List[str]) -> int:
+    """
+    Live ping monitoring dashboard dengan graph penuh dan WiFi stats.
+
+    Usage: ai mon net live [target] [--interval N] [--window N]
+    """
+    if psutil is None:
+        ansi.print_brief_error("Fitur monitoring butuh library 'psutil'.")
+        print("Install (Fedora): sudo dnf install python3-psutil")
+        return 1
+
+    # Parse arguments
+    target = "google.com"
+    interval = 1.0
+    window = 60
+
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        if arg in ("--interval", "-i") and i + 1 < len(args):
+            try:
+                interval = float(args[i + 1])
+                interval = max(0.2, min(5.0, interval))
+            except ValueError:
+                pass
+            i += 2
+        elif arg in ("--window", "-w") and i + 1 < len(args):
+            try:
+                window = int(args[i + 1])
+                window = max(20, min(300, window))
+            except ValueError:
+                pass
+            i += 2
+        elif not arg.startswith("-"):
+            target = arg.strip()
+            i += 1
+        else:
+            i += 1
+
+    # Initialize monitoring
+    ping = PingMonitor(target=target, window=window)
+    ping.start()
+
+    # Network speed tracker
+    ns_tracker = _NetSpeedTracker()
+
+    # Box drawing characters (auto-fallback)
+    if ansi.supports_unicode():
+        BOX = {
+            'tl': '┌', 'tr': '┐', 'bl': '└', 'br': '┘',
+            'h': '─', 'v': '│',
+            'lt': '├', 'rt': '┤', 'tt': '┬', 'bt': '┴', 'x': '┼'
+        }
+    else:
+        BOX = {
+            'tl': '+', 'tr': '+', 'bl': '+', 'br': '+',
+            'h': '-', 'v': '|',
+            'lt': '+', 'rt': '+', 'tt': '+', 'bt': '+', 'x': '+'
+        }
+
+    # Alternate screen
+    ansi.alt_screen_enter()
+    ansi.cursor_hide()
+
+    input_muter = ansi.MuteInputDuringWait()
+
+    try:
+        with input_muter:
+            while True:
+                cols, rows = ansi.term_size()
+                width = min(cols, 120)
+
+                # Get stats
+                stats = ping.get_stats()
+                wifi = collect_wifi_stats()
+                ns_tracker.update()
+
+                # Build output
+                out: List[str] = []
+
+                # Header
+                now_time = time.strftime("%A | %H:%M:%S")
+                header_left = f"{ansi.c_cyan()}{ansi.c_bold()}AI MON {ansi.c_dim()}•{ansi.c_reset()} {ansi.c_cyan()}{ansi.c_bold()}NET LIVE{ansi.c_reset()}"
+                header_right = f"{ansi.c_dim()}{now_time}{ansi.c_reset()}"
+
+                # Top border
+                out.append(BOX['tl'] + BOX['h'] * (width - 2) + BOX['tr'])
+
+                # Header line
+                out.append(_box_line(header_left, header_right, width, BOX['v']))
+
+                # Separator
+                out.append(BOX['lt'] + BOX['h'] * (width - 2) + BOX['rt'])
+
+                # Target info
+                resolved = stats.get('resolved_ip', target)
+                target_line = f"{ansi.c_bold()}TARGET{ansi.c_reset()}  {target}"
+                if resolved and resolved != target:
+                    target_line += f" {ansi.c_dim()}({resolved}){ansi.c_reset()}"
+                out.append(_box_line(target_line, "", width, BOX['v']))
+
+                # Config
+                config_line = f"{ansi.c_bold()}CONFIG{ansi.c_reset()}  interval: {interval}s    window: {window} samples"
+                out.append(_box_line(config_line, "", width, BOX['v']))
+
+                # Separator
+                out.append(BOX['lt'] + BOX['h'] * (width - 2) + BOX['rt'])
+
+                # WiFi stats (if available)
+                if wifi.get('ok'):
+                    ssid = wifi.get('ssid', '?')
+                    sig = wifi.get('signal_dbm')
+                    sig_str = f"{sig:.0f} dBm" if isinstance(sig, (int, float)) else "N/A"
+                    sig_col = col_by_dbm(sig) if isinstance(sig, (int, float)) else ansi.c_dim()
+
+                    # WiFi line 1: SSID + Signal + Channel
+                    wifi1 = f"{ansi.c_bold()}WiFi{ansi.c_reset()}    {ssid} {sig_col}({sig_str}){ansi.c_reset()}"
+
+                    # Get channel/freq from iface info if possible
+                    rx_rate = wifi.get('rx_bitrate', 'N/A')
+                    tx_rate = wifi.get('tx_bitrate', 'N/A')
+
+                    # Try to get temperature
+                    wifi_temp = _get_wifi_temperature()
+                    temp_str = f"Temp: {wifi_temp}°C" if wifi_temp else "Temp: N/A"
+
+                    wifi1_right = f"  {ansi.c_dim()}{temp_str}{ansi.c_reset()}"
+                    out.append(_box_line(wifi1, wifi1_right, width, BOX['v']))
+
+                    # WiFi line 2: Link speeds
+                    link_line = f"{ansi.c_bold()}Link{ansi.c_reset()}    TX {ansi.c_green()}{tx_rate}{ansi.c_reset()}  RX {ansi.c_green()}{rx_rate}{ansi.c_reset()}"
+                    out.append(_box_line(link_line, "", width, BOX['v']))
+
+                    # WiFi line 3: Current traffic
+                    rx_speed = human_rate_bps(ns_tracker.rx * 8)  # bytes/s to bits/s
+                    tx_speed = human_rate_bps(ns_tracker.tx * 8)
+                    traffic_line = f"{ansi.c_bold()}Traffic{ansi.c_reset()} ↓ {ansi.c_cyan()}{rx_speed}{ansi.c_reset()}    ↑ {ansi.c_yellow()}{tx_speed}{ansi.c_reset()}"
+                    out.append(_box_line(traffic_line, "", width, BOX['v']))
+
+                    # Separator
+                    out.append(BOX['lt'] + BOX['h'] * (width - 2) + BOX['rt'])
+
+                # Ping stats
+                last = stats.get('last_ping')
+                avg = stats.get('avg_ping')
+                jitter = stats.get('jitter')
+                loss = stats.get('loss_pct', 0.0)
+
+                last_str = f"{last:.0f}ms" if last else "TO"
+                avg_str = f"{avg:.0f}ms" if avg else "N/A"
+                jit_str = f"{jitter:.0f}ms" if jitter else "N/A"
+                loss_str = f"{loss:.0f}%"
+
+                last_col = col_by_ping(last) if last else ansi.c_red()
+                avg_col = col_by_ping(avg) if avg else ansi.c_dim()
+                jit_col = ansi.c_green() if (jitter and jitter < 10) else (ansi.c_yellow() if (jitter and jitter < 50) else ansi.c_red())
+                loss_col = ansi.c_green() if loss < 1 else (ansi.c_yellow() if loss < 5 else ansi.c_red())
+
+                ping_line = (
+                    f"{ansi.c_bold()}PING{ansi.c_reset()}    "
+                    f"LAST {last_col}{last_str}{ansi.c_reset()}    "
+                    f"AVG {avg_col}{avg_str}{ansi.c_reset()}    "
+                    f"JITTER {jit_col}{jit_str}{ansi.c_reset()}    "
+                    f"LOSS {loss_col}{loss_str}{ansi.c_reset()}"
+                )
+                out.append(_box_line(ping_line, "", width, BOX['v']))
+
+                # Separator
+                out.append(BOX['lt'] + BOX['h'] * (width - 2) + BOX['rt'])
+
+                # Graph section
+                history = stats.get('history', [])
+                graph_lines = _draw_ping_graph(history, width - 4)
+
+                for line in graph_lines:
+                    out.append(f"{BOX['v']} {line:<{width-4}} {BOX['v']}")
+
+                # Legend
+                legend = (
+                    f"{ansi.c_green()}●{ansi.c_reset()} 0-50ms  "
+                    f"{ansi.c_cyan()}●{ansi.c_reset()} 50-100ms  "
+                    f"{ansi.c_yellow()}●{ansi.c_reset()} 100-200ms  "
+                    f"{ansi.c_red()}●{ansi.c_reset()} >200ms  "
+                    f"{ansi.c_red()}×{ansi.c_reset()} timeout"
+                )
+                out.append(_box_line(f"Legend: {legend}", "", width, BOX['v']))
+
+                # Bottom border
+                out.append(BOX['bl'] + BOX['h'] * (width - 2) + BOX['br'])
+
+                # Footer tip
+                out.append(f"{ansi.c_dim()}Ctrl+C untuk keluar.   Tip: 'ai mon net {target}' untuk diagnosis (dns + wifi).{ansi.c_reset()}")
+
+                # Render (cursor home + erase + single write)
+                sys.stdout.write('\x1b[H\x1b[J')
+                sys.stdout.write('\n'.join(out) + '\n')
+                sys.stdout.flush()
+
+                time.sleep(interval)
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        ping.stop()
+        ansi.cursor_show()
+        ansi.alt_screen_exit()
+
+    return 0
+
+
+def _box_line(left: str, right: str, width: int, vert: str) -> str:
+    """Create a box line with left and right content."""
+    import re
+    ansi_re = re.compile(r'\x1b\[[0-9;]*m')
+
+    left_vis = len(ansi_re.sub('', left))
+    right_vis = len(ansi_re.sub('', right))
+
+    padding = width - 4 - left_vis - right_vis
+    if padding < 0:
+        padding = 0
+
+    return f"{vert} {left}{' ' * padding}{right} {vert}"
+
+
+def _draw_ping_graph(history: List[Optional[float]], width: int) -> List[str]:
+    """
+    Draw ping graph dengan Y-axis labels dan full width.
+    Returns list of lines untuk di-render.
+    """
+    if not history:
+        return [" " * width]
+
+    # Get latest data points (as many as width allows for graph area)
+    graph_width = width - 10  # Reserve 10 chars for Y-axis labels
+    visible = history[-graph_width:] if len(history) > graph_width else history
+
+    # Calculate scale
+    valid = [v for v in visible if v is not None]
+    if not valid:
+        return ["No data yet..."]
+
+    max_val = max(valid)
+    min_val = 0  # Always start from 0 for ping
+
+    # Round max to nice number
+    if max_val < 50:
+        scale_max = 50
+    elif max_val < 100:
+        scale_max = 100
+    elif max_val < 200:
+        scale_max = 200
+    elif max_val < 500:
+        scale_max = 500
+    else:
+        scale_max = int((max_val + 99) // 100 * 100)
+
+    # Y-axis labels (5 levels)
+    levels = [scale_max, scale_max * 3 // 4, scale_max // 2, scale_max // 4, 0]
+
+    # Graph height
+    graph_height = 6
+
+    lines = []
+
+    # Draw from top to bottom
+    for row in range(graph_height):
+        level_idx = row * len(levels) // graph_height
+        if level_idx < len(levels):
+            label = f"{levels[level_idx]:>5.0f}ms"
+        else:
+            label = "      "
+
+        # Draw line
+        if row == 0:
+            line_char = '┤'
+        elif row == graph_height - 1:
+            line_char = '└'
+        else:
+            line_char = '│'
+
+        row_str = f"{label} {line_char}"
+
+        # Add data points
+        for val in visible:
+            if val is None:
+                # Timeout
+                row_str += f"{ansi.c_red()}×{ansi.c_reset()}"
+            else:
+                # Calculate which row this point should appear in
+                ratio = (val - min_val) / (scale_max - min_val) if scale_max > min_val else 0
+                ratio = max(0.0, min(1.0, ratio))
+
+                # Invert Y (top = high value)
+                point_row = int((1.0 - ratio) * (graph_height - 1))
+
+                if point_row == row:
+                    # Color based on value
+                    if val < 50:
+                        col = ansi.c_green()
+                    elif val < 100:
+                        col = ansi.c_cyan()
+                    elif val < 200:
+                        col = ansi.c_yellow()
+                    else:
+                        col = ansi.c_red()
+                    row_str += f"{col}●{ansi.c_reset()}"
+                else:
+                    row_str += " "
+
+        lines.append(row_str)
+
+    # X-axis
+    x_axis = "   0ms " + '└' + '─' * graph_width
+    lines.append(x_axis)
+
+    # Time label
+    time_label = " " * 7 + f"◄{'─' * ((graph_width - 35) // 2)} TIME (oldest ← newest) {'─' * ((graph_width - 35) // 2)}►"
+    lines.append(time_label[:width])
+
+    return lines
+
+
+def _get_wifi_temperature() -> Optional[int]:
+    """Get WiFi chip temperature if available."""
+    if not psutil:
+        return None
+
+    try:
+        temps = psutil.sensors_temperatures()
+        # Look for iwlwifi, ath10k, etc
+        for key in temps:
+            if 'iwl' in key.lower() or 'ath' in key.lower() or 'wifi' in key.lower():
+                entries = temps[key]
+                if entries:
+                    return int(entries[0].current)
+    except Exception:
+        pass
+
+    return None
+
+
+class _NetSpeedTracker:
+    """Track network speed for traffic display."""
+
+    def __init__(self, iface: Optional[str] = None):
+        self.iface = iface
+        self.rx = 0.0
+        self.tx = 0.0
+        self.prev_stats = None
+        self.prev_time = time.time()
+
+    def update(self):
+        """Update speed readings."""
+        stats = collect_network_stats(iface=self.iface)
+        if not stats.get('ok'):
+            return
+
+        curr_time = time.time()
+        dt = curr_time - self.prev_time
+
+        if dt <= 0:
+            return
+
+        curr_rx = stats.get('bytes_recv', 0)
+        curr_tx = stats.get('bytes_sent', 0)
+
+        if self.prev_stats:
+            prev_rx = self.prev_stats.get('bytes_recv', 0)
+            prev_tx = self.prev_stats.get('bytes_sent', 0)
+
+            self.rx = (curr_rx - prev_rx) / dt
+            self.tx = (curr_tx - prev_tx) / dt
+
+        self.prev_stats = {'bytes_recv': curr_rx, 'bytes_sent': curr_tx}
+        self.prev_time = curr_time
