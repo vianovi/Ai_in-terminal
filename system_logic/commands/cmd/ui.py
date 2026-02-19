@@ -1,57 +1,113 @@
+"""
+commands/cmd/ui.py
+==================
+Display & rendering layer untuk `cmd` command.
+
+Exported:
+    print_help()                                          -> None
+    render_blocks(purpose, command, risk, backend)        -> None
+
+Internal (tidak diexport):
+    _persona(backend)  -> tuple[str, str]
+"""
 from __future__ import annotations
 
 from system_logic.terminal.ansi import (
-    print_info,
-    print_warn,
-    tag,
-    wrap,
-    term_size,
-    hr,
     c_bold,
     c_cyan,
     c_dim,
-    c_green,
-    c_red,
     c_reset,
     c_yellow,
+    hr,
+    tag,
+    term_size,
+    wrap,
 )
 
 
-def persona_label(backend: str) -> tuple[str, str]:
-    return ("Sili Pinter", "💍") if backend == "api" else ("Sili AI", "🌿")
+# ============================================================
+# Internal: Persona resolver
+# ============================================================
 
+def _persona(backend: str) -> tuple[str, str]:
+    """
+    Kembalikan (nama, emoji) berdasarkan backend aktif.
+
+    Args:
+        backend: 'api' atau 'local' (nilai lain fallback ke local).
+
+    Returns:
+        Tuple (nama_display, emoji).
+            'api'   -> ('Sili Pinter', '💍')
+            'local' -> ('Sili AI',     '🌿')
+    """
+    if backend == "api":
+        return ("Sili Pinter", "💍")
+    return ("Sili AI", "🌿")
+
+
+# ============================================================
+# Public: Help
+# ============================================================
 
 def print_help() -> None:
+    """Tampilkan halaman bantuan untuk command `cmd`."""
     cols, _ = term_size()
-    h: list[str] = []
-    h.append(f"{tag('SILI', c_cyan())} {tag('CMD', c_yellow())} {c_dim()}•{c_reset()} bikin 1 command yang aman + siap dieksekusi")
-    h.append("")
-    h.append(wrap("📌 Cara pakai:", width=min(cols, 100)))
-    h.append(wrap("  cmd \"apa yang kamu mau\"", width=min(cols, 100)))
-    h.append("")
-    h.append(wrap("🎛️  Flags:", width=min(cols, 100)))
-    h.append(wrap("  --help, -h   Tampilkan help", width=min(cols, 100)))
-    h.append("")
-    h.append(wrap("🧠 Output:", width=min(cols, 100)))
-    h.append(wrap("  - Tujuan (singkat)", width=min(cols, 100)))
-    h.append(wrap("  - Command (1 baris)", width=min(cols, 100)))
-    h.append(wrap("  - Risiko (1–3 kalimat)", width=min(cols, 100)))
-    h.append("")
-    h.append(wrap("✅ Aksi cepat setelah itu: Run / Copy / Edit / Cancel", width=min(cols, 100)))
-    print("\n".join(h))
+    w = min(cols, 100)
+
+    lines: list[str] = [
+        (
+            f"{tag('SILI', c_cyan())} {tag('CMD', c_yellow())} "
+            f"{c_dim()}•{c_reset()} "
+            "Generate 1 command Linux yang aman + siap dieksekusi"
+        ),
+        "",
+        wrap("📌 Cara pakai:", width=w),
+        wrap('  cmd "apa yang kamu mau lakukan"', width=w),
+        "",
+        wrap("🎛️  Flags:", width=w),
+        wrap("  --help, -h   Tampilkan halaman ini", width=w),
+        "",
+        wrap("🧠 Output yang dihasilkan:", width=w),
+        wrap("  Tujuan   — penjelasan singkat apa yang dilakukan command", width=w),
+        wrap("  Command  — satu baris siap pakai", width=w),
+        wrap("  Risiko   — 1–3 kalimat tentang efek samping / bahaya", width=w),
+        "",
+        wrap("✅ Aksi setelah generate:", width=w),
+        wrap("  run  / r  — Langsung jalankan di shell", width=w),
+        wrap("  copy / c  — Print command untuk dicopy", width=w),
+        wrap("  edit / e  — Edit command sebelum dijalankan", width=w),
+        wrap("  cancel    — Batalkan tanpa melakukan apapun", width=w),
+    ]
+    print("\n".join(lines))
 
 
-def render_blocks(cmd: str, risk: str, purpose: str, backend: str) -> None:
+# ============================================================
+# Public: Result renderer
+# ============================================================
+
+def render_blocks(purpose: str, command: str, risk: str, backend: str) -> None:
+    """
+    Render hasil generate ke terminal dalam format blok yang rapi.
+
+    Args:
+        purpose : Tujuan / penjelasan command (dari model).
+        command : Command satu baris yang siap dijalankan (dari model).
+        risk    : Penjelasan risiko singkat (dari model).
+        backend : 'api' atau 'local' — menentukan persona yang ditampilkan.
+    """
     cols, _ = term_size()
-    w = min(cols, 110)
-    label, emo = persona_label(backend)
-    print(f"{c_bold()}{emo} {label}:{c_reset()} {c_dim()}(hasil generate){c_reset()}")
+    w       = min(cols, 110)
+    name, emo = _persona(backend)
+
+    print(f"\n{c_bold()}{emo} {name}:{c_reset()} {c_dim()}(hasil generate){c_reset()}")
     print(f"{c_dim()}{hr(width=min(cols, 60))}{c_reset()}")
 
     if purpose:
-        print(f"{c_bold()}🎯 Tujuan:{c_reset()} {wrap(purpose, width=w)}")
+        print(f"{c_bold()}🎯 Tujuan  :{c_reset()} {wrap(purpose, width=w)}")
 
-    print(f"{c_bold()}🧾 Command:{c_reset()}")
-    print(wrap(cmd or "(empty)", width=w))
+    print(f"{c_bold()}🧾 Command :{c_reset()}")
+    print(f"   {wrap(command if command else '(kosong — lihat pesan error di atas)', width=w)}")
 
-    print(f"{c_bold()}⚠️  Risiko:{c_reset()} {wrap(risk or 'Risiko tidak dijelaskan.', width=w)}")
+    risk_text = risk if risk else "Risiko tidak dijelaskan."
+    print(f"{c_bold()}⚠️  Risiko  :{c_reset()} {wrap(risk_text, width=w)}")
