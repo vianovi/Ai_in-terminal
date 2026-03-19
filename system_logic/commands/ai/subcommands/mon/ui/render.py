@@ -1,55 +1,61 @@
 """
 MON UI Render Components.
-Menangani visualisasi grafik batang (Bar Charts) dan grafik garis (Sparklines).
-Fokus: Estetika (Color-coded) dan Kejelasan Informasi.
+Menangani visualisasi: bar charts, sparklines, ping graph, speed tracker.
+
+Semua visual component yang dipakai oleh LEBIH DARI SATU modul UI
+dikumpulkan di sini agar tidak ada duplikasi kode.
+
+Functions:
+    draw_bar()           — Colored horizontal bar chart
+    draw_sparkline()     — ASCII/Unicode sparkline graph
+    draw_ping_graph()    — Full ping graph dengan Y-axis (pindahan dari dashboard+reports)
+    color_by_value()     — ANSI color berdasarkan nilai
+    format_uptime()      — Format seconds → "2d 4h 12m"
+    trim_string()        — Safe string truncation dengan ellipsis
+    align_columns()      — Layout dua kolom kiri-kanan
+
+Classes:
+    NetSpeedTracker      — Track RX/TX speed (merge dari dashboard._NetSpeedTracker
+                           dan reports._NetSpeed yang identik)
 """
 
-import math
-from typing import Optional, List, Dict
+from __future__ import annotations
 
-# Import library warna UI (Pastikan path ini sesuai dengan project-mu)
-# Fallback ke path standar project jika path kustom tidak ditemukan
-try:
-    from system_logic.terminal import ansi
-except ImportError:
-    try:
-        from ai_logic.ui import ansi
-    except ImportError:
-        # Fallback dummy class jika library ANSI benar-benar tidak ada (Anti-Crash)
-        class ansi:
-            @staticmethod
-            def c_dim(): return ""
-            @staticmethod
-            def c_reset(): return ""
-            @staticmethod
-            def c_green(): return ""
-            @staticmethod
-            def c_yellow(): return ""
-            @staticmethod
-            def c_red(): return ""
-            @staticmethod
-            def c_cyan(): return ""
+import re
+import time
+from typing import Optional, List, Dict, Any
+
+from system_logic.terminal import ansi
+from ..collectors.network import collect_network_stats
+
+# Regex ANSI untuk hitung visible length
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
-def draw_bar(pct: float, width: int = 14, limits: Optional[Dict[str, int]] = None) -> str:
+# ==========================================================
+# Bar chart
+# ==========================================================
+
+def draw_bar(
+    pct: float,
+    width: int = 14,
+    limits: Optional[Dict[str, int]] = None,
+) -> str:
     """
     Membuat bar chart text horisontal dengan pewarnaan dinamis.
-    Style: [██████░░░] 60%
-    """
-    # 1. Clamp percentage 0-100
-    val = max(0.0, min(100.0, float(pct or 0.0)))
+    Style: ██████░░░
 
-    # 2. Hitung jumlah blok isi
+    Args:
+        pct:    Nilai 0–100
+        width:  Lebar bar dalam karakter
+        limits: Dict opsional {"warn": int, "crit": int}
+    """
+    val  = max(0.0, min(100.0, float(pct or 0.0)))
     fill = int(width * val / 100.0)
 
-    # 3. Tentukan batas threshold warna
-    if limits:
-        warn = limits.get('warn', 70)
-        crit = limits.get('crit', 90)
-    else:
-        warn, crit = 70, 90
+    warn = limits.get("warn", 70) if limits else 70
+    crit = limits.get("crit", 90) if limits else 90
 
-    # 4. Pilih warna
     if val <= warn:
         col = ansi.c_green()
     elif val <= crit:
@@ -57,115 +63,232 @@ def draw_bar(pct: float, width: int = 14, limits: Optional[Dict[str, int]] = Non
     else:
         col = ansi.c_red()
 
-    # 5. Render String
-    # Menggunakan '█' agar terlihat solid/tinggi
-    bar_filled = "█" * fill
-    # Menggunakan '░' atau '·' sebagai track kosong yang samar
-    bar_empty = "░" * (width - fill)
-
-    return f"{col}{bar_filled}{ansi.c_dim()}{bar_empty}{ansi.c_reset()}"
+    return f"{col}{'█' * fill}{ansi.c_dim()}{'░' * (width - fill)}{ansi.c_reset()}"
 
 
-def draw_sparkline(values: List[Optional[float]], width: int = 40, height: int = 1, limits: Optional[Dict[str, int]] = None) -> List[str]:
+# ==========================================================
+# Sparkline
+# ==========================================================
+
+def draw_sparkline(
+    values: List[Optional[float]],
+    width: int = 40,
+    height: int = 1,
+    limits: Optional[Dict[str, int]] = None,
+) -> List[str]:
     """
     Generate ASCII/Unicode sparkline berwarna untuk data series.
-    Fitur:
-    - Handling 'None' sebagai Timeout ('x' Merah).
-    - Auto-scaling tinggi grafik.
-    - Pewarnaan per-titik data (bukan satu warna untuk seluruh grafik).
+
+    Args:
+        values:  List nilai (None = timeout/missing)
+        width:   Lebar grafik dalam karakter
+        limits:  {"warn": int, "crit": int} — None = ping mode (lower is better)
     """
     if not values:
         return [" " * width]
 
-    # Ambil data sejumlah lebar grafik (dari yang paling baru)
     visible_data = values[-width:]
+    valid_vals   = [v for v in visible_data if v is not None]
 
-    # Kumpulkan nilai numerik yang valid (bukan None) untuk hitung skala
-    valid_vals = [v for v in visible_data if v is not None]
+    blocks    = [" ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
+    ping_mode = limits is None
 
-    # Default values untuk display kosong
-    current_lines = []
-
-    # --- BLOCK CHARACTERS (Height levels 0-7) ---
-    blocks = [" ", "▂", "▃", "▄", "▅", "▆", "▇", "█"]
-
-    # Thresholds default untuk warna latency (ping ms)
-    # Jika nilainya kecil = Bagus (Green), Besar = Jelek (Red)
-    # Kebalikan dari RAM/CPU.
-    # Kita asumsikan default use-case adalah Net Latency kecuali limit dikirim khusus.
-    ping_mode = True
     if limits is None:
-        limits = {'warn': 100, 'crit': 200}
-    else:
-        ping_mode = False # Jika user kirim limit sendiri, pakai logika value > limit = merah
+        limits = {"warn": 100, "crit": 200}
 
-    # Skala: Cari max value agar grafik tidak 'gepeng' atau 'terpotong'
-    # Jika ping rendah stabil, scale max minimal 10ms agar noise kecil tidak terlihat besar
-    local_min = min(valid_vals) if valid_vals else 0
-    local_max = max(valid_vals) if valid_vals else 100
-    scale_range = max(1.0, local_max - 0) # Base-0 scaling sering lebih mudah dibaca untuk ping
-
-    line_str = ""
+    local_max   = max(valid_vals) if valid_vals else 100
+    scale_range = max(1.0, local_max)
+    line_str    = ""
 
     for val in visible_data:
-        # A) HANDLE TIMEOUT / DATA NULL
         if val is None:
-            # Tanda 'x' tebal merah sesuai request
             line_str += f"{ansi.c_red()}×{ansi.c_reset()}"
             continue
 
-        # B) PEWARNAAN DINAMIS (Per Point)
         if ping_mode:
-            # Logic Ping: Makin kecil makin hijau
             if val < 50:
-                color = ansi.c_green()   # Cepat (<50ms)
-            elif val < 100:
-                color = ansi.c_cyan()    # Normal (<100ms) - Biru muda
-            elif val < limits['crit']:
-                color = ansi.c_yellow()  # Agak lag
-            else:
-                color = ansi.c_red()     # Lag parah
-        else:
-            # Logic Umum (Load/RAM): Makin kecil makin aman
-            if val < limits.get('warn', 70):
                 color = ansi.c_green()
-            elif val < limits.get('crit', 90):
+            elif val < 100:
+                color = ansi.c_cyan()
+            elif val < limits["crit"]:
+                color = ansi.c_yellow()
+            else:
+                color = ansi.c_red()
+        else:
+            if val < limits.get("warn", 70):
+                color = ansi.c_green()
+            elif val < limits.get("crit", 90):
                 color = ansi.c_yellow()
             else:
                 color = ansi.c_red()
 
-        # C) KALKULASI TINGGI BLOK
-        # Normalize 0..1 relative terhadap window max
-        ratio = (val - 0) / scale_range
-        # Clamp ratio
-        ratio = max(0.0, min(1.0, ratio))
-
+        ratio     = max(0.0, min(1.0, val / scale_range))
         block_idx = int(ratio * (len(blocks) - 1))
-        char = blocks[block_idx]
+        line_str += f"{color}{blocks[block_idx]}{ansi.c_reset()}"
 
-        line_str += f"{color}{char}{ansi.c_reset()}"
-
-    # Pad bagian kiri jika data belum memenuhi lebar layar
     padding = width - len(visible_data)
     if padding > 0:
         line_str = (" " * padding) + line_str
 
-    # Return list (karena struktur lama me-return list of strings)
     return [line_str]
 
 
+# ==========================================================
+# Ping graph — SINGLE SOURCE OF TRUTH
+# (Sebelumnya duplikat di dashboard.py DAN reports.py)
+# ==========================================================
+
+def draw_ping_graph(
+    history: List[Optional[float]],
+    width: int = 80,
+) -> List[str]:
+    """
+    Draw ping graph dengan Y-axis labels dan full width.
+    Ini adalah SATU-SATUNYA definisi fungsi ini — tidak ada duplikat.
+
+    Sebelumnya ada di:
+        - ui/dashboard.py  (_draw_ping_graph)
+        - ui/reports.py    (_draw_ping_graph)
+
+    Args:
+        history: List ping values (None = timeout)
+        width:   Total lebar area render
+
+    Returns:
+        List of strings (lines) untuk di-print/append ke output.
+    """
+    if not history:
+        return [f"{ansi.c_dim()}Waiting for data...{ansi.c_reset()}"]
+
+    graph_width = max(10, width - 10)  # Reserve 10 chars untuk Y-axis
+    visible     = history[-graph_width:] if len(history) > graph_width else history
+
+    valid = [v for v in visible if v is not None]
+    if not valid:
+        return [f"{ansi.c_dim()}No valid pings yet...{ansi.c_reset()}"]
+
+    max_val = max(valid)
+
+    # Round scale ke angka yang rapi
+    if max_val < 50:
+        scale_max = 50
+    elif max_val < 100:
+        scale_max = 100
+    elif max_val < 200:
+        scale_max = 200
+    elif max_val < 500:
+        scale_max = 500
+    else:
+        scale_max = int((max_val + 99) // 100 * 100)
+
+    levels       = [scale_max, scale_max * 3 // 4, scale_max // 2, scale_max // 4, 0]
+    graph_height = 6
+    lines        = []
+
+    for row in range(graph_height):
+        level_idx = row * len(levels) // graph_height
+        label     = f"{levels[level_idx]:>5.0f}ms" if level_idx < len(levels) else "      "
+        line_char = "┤" if row == 0 else ("└" if row == graph_height - 1 else "│")
+
+        row_str = f"{label} {line_char}"
+
+        for val in visible:
+            if val is None:
+                row_str += f"{ansi.c_red()}×{ansi.c_reset()}"
+            else:
+                ratio     = (val / scale_max) if scale_max > 0 else 0
+                ratio     = max(0.0, min(1.0, ratio))
+                point_row = int((1.0 - ratio) * (graph_height - 1))
+
+                if point_row == row:
+                    if val < 50:
+                        col = ansi.c_green()
+                    elif val < 100:
+                        col = ansi.c_cyan()
+                    elif val < 200:
+                        col = ansi.c_yellow()
+                    else:
+                        col = ansi.c_red()
+                    row_str += f"{col}●{ansi.c_reset()}"
+                else:
+                    row_str += " "
+
+        lines.append(row_str)
+
+    # X-axis
+    lines.append("   0ms " + "└" + "─" * graph_width)
+
+    # Time label
+    mid = max(0, (graph_width - 35) // 2)
+    lines.append(
+        " " * 7
+        + f"◄{'─' * mid} TIME (oldest ← newest) {'─' * mid}►"
+    )
+
+    return lines
+
+
+# ==========================================================
+# NetSpeedTracker — SINGLE SOURCE OF TRUTH
+# (Merge dari dashboard.NetSpeedometer DAN reports._NetSpeed
+#  yang logicnya identik)
+# ==========================================================
+
+class NetSpeedTracker:
+    """
+    Track RX/TX network speed (bytes/sec).
+
+    Ini adalah merge dari dua class yang sebelumnya identik:
+        - ui/dashboard.py  → NetSpeedometer / _NetSpeedTracker
+        - ui/reports.py    → _NetSpeed (inner class)
+
+    Usage:
+        tracker = NetSpeedTracker()
+        tracker.update()
+        print(tracker.rx, tracker.tx)  # bytes/sec
+    """
+
+    def __init__(self, iface: Optional[str] = None) -> None:
+        self.iface      = iface
+        self.rx         = 0.0   # bytes/sec received
+        self.tx         = 0.0   # bytes/sec sent
+        self._prev:     Optional[Dict[str, int]] = None
+        self._prev_time = time.time()
+
+    def update(self) -> None:
+        """Baca network stats terbaru dan hitung speed."""
+        stats = collect_network_stats(iface=self.iface)
+        if not stats.get("ok"):
+            return
+
+        curr_time = time.time()
+        dt        = curr_time - self._prev_time
+        if dt <= 0:
+            return
+
+        curr_rx = int(stats.get("bytes_recv", 0))
+        curr_tx = int(stats.get("bytes_sent", 0))
+
+        if self._prev:
+            self.rx = (curr_rx - self._prev["rx"]) / dt
+            self.tx = (curr_tx - self._prev["tx"]) / dt
+
+        self._prev      = {"rx": curr_rx, "tx": curr_tx}
+        self._prev_time = curr_time
+
+
+# ==========================================================
+# Color helpers
+# ==========================================================
+
 def color_by_value(value: Optional[float], thresholds: dict) -> str:
-    """
-    Return ANSI color code berdasarkan nilai.
-    Berguna untuk mewarnai teks angka (misal: "Ping: 200ms").
-    """
+    """Return ANSI color berdasarkan nilai vs thresholds."""
     if value is None:
         return ansi.c_dim()
 
-    # Threshold default (Logika Standard: High is Bad)
-    low = thresholds.get('low', 0)
-    warn = thresholds.get('warn', 70)
-    crit = thresholds.get('crit', 90)
+    low  = thresholds.get("low",  0)
+    warn = thresholds.get("warn", 70)
+    crit = thresholds.get("crit", 90)
 
     if value <= low:
         return ansi.c_dim()
@@ -177,58 +300,54 @@ def color_by_value(value: Optional[float], thresholds: dict) -> str:
         return ansi.c_red()
 
 
+# ==========================================================
+# String formatting helpers
+# ==========================================================
+
 def format_uptime(seconds: Optional[int]) -> str:
-    """Format uptime seconds ke string pendek: '2d 4h 12m'."""
+    """Format uptime seconds → '2d 4h 12m'."""
     if seconds is None:
         return "n/a"
-
-    days = seconds // 86400
+    days  = seconds // 86400
     hours = (seconds % 86400) // 3600
-    mins = (seconds % 3600) // 60
+    mins  = (seconds % 3600) // 60
 
     parts = []
-    if days > 0: parts.append(f"{days}d")
-    if hours > 0: parts.append(f"{hours}h")
-    if mins > 0 or not parts: parts.append(f"{mins}m")
-
-    return " ".join(parts[:2]) # Ambil 2 komponen terbesar saja agar ringkas
+    if days  > 0:              parts.append(f"{days}d")
+    if hours > 0:              parts.append(f"{hours}h")
+    if mins  > 0 or not parts: parts.append(f"{mins}m")
+    return " ".join(parts[:2])
 
 
 def trim_string(s: str, maxlen: int, position: str = "end") -> str:
-    """Safe string trimmer (Ellipsis handler)."""
-    s = s or ""
+    """Safe string trimmer dengan ellipsis."""
+    s       = s or ""
+    cut_len = max(1, maxlen - 1)
     if len(s) <= maxlen:
         return s
-
-    ellipsis = "…"
-    cut_len = max(1, maxlen - 1)
-
     if position == "start":
-        return ellipsis + s[-cut_len:]
+        return "…" + s[-cut_len:]
     elif position == "middle":
         half = cut_len // 2
-        return s[:half] + ellipsis + s[-(cut_len - half):]
-    else: # end
-        return s[:cut_len] + ellipsis
+        return s[:half] + "…" + s[-(cut_len - half):]
+    return s[:cut_len] + "…"
 
 
-def align_columns(left: str, right: str, width: int, fill_char: str = " ") -> str:
+def align_columns(
+    left:      str,
+    right:     str,
+    width:     int,
+    fill_char: str = " ",
+) -> str:
     """
-    Membuat layout dua kolom (kiri-kanan) yang rapi
-    meskipun ada kode warna ANSI yang tidak terlihat.
+    Layout dua kolom kiri-kanan yang rapi,
+    memperhitungkan ANSI escape codes saat menghitung panjang.
     """
-    import re
-    # Regex untuk membuang kode warna saat menghitung panjang string visible
-    ansi_re = re.compile(r"\x1b\[[0-9;]*m")
-
-    left_vis = len(ansi_re.sub("", left))
-    right_vis = len(ansi_re.sub("", right))
-
+    left_vis  = len(_ANSI_RE.sub("", left))
+    right_vis = len(_ANSI_RE.sub("", right))
     available = width - left_vis - right_vis
+
     if available < 1:
-        # Jika sempit, korbankan teks kiri (truncate)
-        # Note: Ini logika sederhana, truncate string berwarna itu kompleks.
-        # Kita potong teks 'display' secara kasar untuk safety.
         return left + " " + right
 
     return left + (fill_char * available) + right
