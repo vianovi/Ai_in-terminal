@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+"""
+system_logic.bridge
+Root command dispatcher.
+Routing: ask | cmd | ai | toolkit | xray
+"""
+
 from system_logic.terminal.ansi import print_brief_error, print_info
 
 
@@ -21,8 +27,11 @@ def _root_help() -> None:
     print(f"  {prog} ai help")
     print(f"  {prog} toolkit help")
     print(f"  {prog} toolkit deps")
+    print(f"  {prog} xray --help")
+    print(f"  {prog} xray osint ip 8.8.8.8")
+    print(f"  {prog} xray steg detect foto.png")
     print("\nFish tip:")
-    print("  Kamu bisa pakai fungsi fish (kalau sudah dipasang): ask / cmd / ai / toolkit")
+    print("  Kamu bisa pakai fungsi fish (kalau sudah dipasang): ask / cmd / ai / toolkit / xray")
 
 
 def dispatch(argv: list[str], cfg: dict) -> int:
@@ -47,6 +56,10 @@ def dispatch(argv: list[str], cfg: dict) -> int:
 
     if root_cmd == "toolkit":
         from system_logic.commands.toolkit.command import handle
+        return handle(rest, cfg)
+
+    if root_cmd == "xray":
+        from system_logic.commands.xray.command import handle
         return handle(rest, cfg)
 
     print_brief_error(f"Command '{root_cmd}' tidak dikenal.")

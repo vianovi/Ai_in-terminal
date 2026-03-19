@@ -1,16 +1,31 @@
+"""
+core/paths.py
+=============
+Definisi semua path yang digunakan oleh framework ai-term.
+Satu sumber kebenaran untuk semua lokasi file dan direktori.
+
+Sections:
+    [1] Primary app directory
+    [2] Core persistent files
+    [3] Informational paths
+    [4] MON (Monitoring System) paths
+    [5] Toolkit paths
+    [6] Xray paths          ← PATCH: ditambahkan untuk command xray
+"""
 from __future__ import annotations
 
 from pathlib import Path
 
+
 # ============================================================
-# Primary app directory
+# [1] Primary app directory
 # ============================================================
 
 APP_DIR = Path.home() / ".config" / "ai-term"
 
 
 # ============================================================
-# Core persistent files
+# [2] Core persistent files
 # ============================================================
 
 CONFIG_PATH      = APP_DIR / "config.json"
@@ -20,16 +35,16 @@ RUN_PROFILE_PATH = APP_DIR / "run_profile.json"
 
 
 # ============================================================
-# Informational paths (used by status / diagnostics)
+# [3] Informational paths (used by status / diagnostics)
 # ============================================================
 
-LOGIC_PATH    = Path.home() / ".local" / "bin" / "ai-term"
-FISH_DIR      = Path.home() / ".config" / "fish"
+LOGIC_PATH     = Path.home() / ".local" / "bin" / "ai-term"
+FISH_DIR       = Path.home() / ".config" / "fish"
 FISH_FUNCS_DIR = FISH_DIR / "functions"
 
 
 # ============================================================
-# MON (Monitoring System) paths
+# [4] MON (Monitoring System) paths
 # ============================================================
 
 MON_DATA_DIR         = APP_DIR / "mon_data"
@@ -44,14 +59,23 @@ MON_HISTORY_LOCK     = MON_LOCK_DIR / "history.lock"
 
 
 # ============================================================
-# Toolkit paths
+# [5] Toolkit paths
 # ============================================================
 
 TOOLKIT_ROOT     = Path.home() / "Downloads" / "toolkit"
 TOOLKIT_LOG_PATH = TOOLKIT_ROOT / "toolkit.log"
 TOOLKIT_FAILED   = TOOLKIT_ROOT / "toolkit-failed.txt"
 
-TOOLKIT_DIR_VIDEO   = TOOLKIT_ROOT / "video"
-TOOLKIT_DIR_AUDIO   = TOOLKIT_ROOT / "audio"
-TOOLKIT_DIR_IMAGE   = TOOLKIT_ROOT / "images"
-TOOLKIT_DIR_FETCH   = TOOLKIT_ROOT / "files"
+TOOLKIT_DIR_VIDEO = TOOLKIT_ROOT / "video"
+TOOLKIT_DIR_AUDIO = TOOLKIT_ROOT / "audio"
+TOOLKIT_DIR_IMAGE = TOOLKIT_ROOT / "images"
+TOOLKIT_DIR_FETCH = TOOLKIT_ROOT / "files"
+
+
+# ============================================================
+# [6] Xray paths
+# ============================================================
+
+XRAY_ROOT       = APP_DIR / "xray"
+XRAY_LOG_PATH   = XRAY_ROOT / "xray.log"
+XRAY_EXPORT_DIR = XRAY_ROOT / "exports"

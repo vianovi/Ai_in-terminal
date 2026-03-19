@@ -1,96 +1,200 @@
-system_logic/
-  __init__.py                      # expose versi/package info (opsional)
+AI_in-terminal/system_logic
+├── app
+│   ├── bridge.py
+│   ├── __init__.py
+│   └── __pycache__
+│       ├── bridge.cpython-314.pyc
+│       └── __init__.cpython-314.pyc
+├── backends
+│   ├── api_gemini.py
+│   ├── api_openai.py
+│   ├── __init__.py
+│   ├── local_ollama.py
+│   └── __pycache__
+│       ├── api_gemini.cpython-314.pyc
+│       ├── api_openai.cpython-314.pyc
+│       ├── __init__.cpython-314.pyc
+│       └── local_ollama.cpython-314.pyc
+├── commands
+│   ├── ai
+│   │   ├── command.py
+│   │   ├── __init__.py
+│   │   ├── __pycache__
+│   │   │   ├── command.cpython-314.pyc
+│   │   │   ├── __init__.cpython-314.pyc
+│   │   │   └── ui.cpython-314.pyc
+│   │   ├── subcommands
+│   │   │   ├── gitx
+│   │   │   │   ├── actions
+│   │   │   │   │   ├── ai.py
+│   │   │   │   │   ├── __init__.py
+│   │   │   │   │   ├── __pycache__
+│   │   │   │   │   │   ├── ai.cpython-314.pyc
+│   │   │   │   │   │   ├── __init__.cpython-314.pyc
+│   │   │   │   │   │   └── repo.cpython-314.pyc
+│   │   │   │   │   └── repo.py
+│   │   │   │   ├── command.py
+│   │   │   │   ├── core
+│   │   │   │   │   ├── git.py
+│   │   │   │   │   ├── __init__.py
+│   │   │   │   │   └── __pycache__
+│   │   │   │   │       ├── git.cpython-314.pyc
+│   │   │   │   │       └── __init__.cpython-314.pyc
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── __pycache__
+│   │   │   │   │   ├── command.cpython-314.pyc
+│   │   │   │   │   └── __init__.cpython-314.pyc
+│   │   │   │   └── ui
+│   │   │   │       ├── __init__.py
+│   │   │   │       ├── __pycache__
+│   │   │   │       │   ├── __init__.cpython-314.pyc
+│   │   │   │       │   └── render.cpython-314.pyc
+│   │   │   │       └── render.py
+│   │   │   ├── help
+│   │   │   │   ├── command.py
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── __pycache__
+│   │   │   │   │   ├── command.cpython-314.pyc
+│   │   │   │   │   └── __init__.cpython-314.pyc
+│   │   │   │   └── ui.py
+│   │   │   ├── __init__.py
+│   │   │   ├── mon
+│   │   │   │   ├── collectors
+│   │   │   │   │   ├── hardware.py
+│   │   │   │   │   ├── __init__.py
+│   │   │   │   │   ├── network.py
+│   │   │   │   │   ├── process.py
+│   │   │   │   │   ├── __pycache__
+│   │   │   │   │   │   ├── hardware.cpython-314.pyc
+│   │   │   │   │   │   ├── __init__.cpython-314.pyc
+│   │   │   │   │   │   ├── network.cpython-314.pyc
+│   │   │   │   │   │   ├── process.cpython-314.pyc
+│   │   │   │   │   │   └── system.cpython-314.pyc
+│   │   │   │   │   └── system.py
+│   │   │   │   ├── command.py
+│   │   │   │   ├── config.py
+│   │   │   │   ├── const.py
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── __pycache__
+│   │   │   │   │   ├── command.cpython-314.pyc
+│   │   │   │   │   ├── config.cpython-314.pyc
+│   │   │   │   │   ├── const.cpython-314.pyc
+│   │   │   │   │   ├── __init__.cpython-314.pyc
+│   │   │   │   │   ├── sentinel.cpython-314.pyc
+│   │   │   │   │   ├── storage.cpython-314.pyc
+│   │   │   │   │   └── utils.cpython-314.pyc
+│   │   │   │   ├── sentinel.py
+│   │   │   │   ├── storage.py
+│   │   │   │   ├── ui
+│   │   │   │   │   ├── dashboard.py
+│   │   │   │   │   ├── __init__.py
+│   │   │   │   │   ├── __pycache__
+│   │   │   │   │   │   ├── dashboard.cpython-314.pyc
+│   │   │   │   │   │   ├── __init__.cpython-314.pyc
+│   │   │   │   │   │   ├── render.cpython-314.pyc
+│   │   │   │   │   │   └── reports.cpython-314.pyc
+│   │   │   │   │   ├── render.py
+│   │   │   │   │   └── reports.py
+│   │   │   │   ├── utils.py
+│   │   │   │   ├── Z-mon_config.json
+│   │   │   │   └── Z-Mon_mtc.md
+│   │   │   ├── __pycache__
+│   │   │   │   ├── __init__.cpython-314.pyc
+│   │   │   │   └── registry.cpython-314.pyc
+│   │   │   ├── registry.py
+│   │   │   ├── run
+│   │   │   │   ├── command.py
+│   │   │   │   ├── const.py
+│   │   │   │   ├── executor.py
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── __pycache__
+│   │   │   │   │   ├── command.cpython-314.pyc
+│   │   │   │   │   ├── const.cpython-314.pyc
+│   │   │   │   │   ├── executor.cpython-314.pyc
+│   │   │   │   │   ├── __init__.cpython-314.pyc
+│   │   │   │   │   ├── safety.cpython-314.pyc
+│   │   │   │   │   ├── session.cpython-314.pyc
+│   │   │   │   │   ├── storage.cpython-314.pyc
+│   │   │   │   │   └── ui.cpython-314.pyc
+│   │   │   │   ├── safety.py
+│   │   │   │   ├── session.py
+│   │   │   │   ├── storage.py
+│   │   │   │   └── ui.py
+│   │   │   ├── status
+│   │   │   │   ├── actions.py
+│   │   │   │   ├── app.py
+│   │   │   │   ├── collectors.py
+│   │   │   │   ├── command.py
+│   │   │   │   ├── deep_select.py
+│   │   │   │   ├── __init__.py
+│   │   │   │   ├── keys.py
+│   │   │   │   ├── models.py
+│   │   │   │   ├── __pycache__
+│   │   │   │   │   ├── actions.cpython-314.pyc
+│   │   │   │   │   ├── app.cpython-314.pyc
+│   │   │   │   │   ├── collectors.cpython-314.pyc
+│   │   │   │   │   ├── command.cpython-314.pyc
+│   │   │   │   │   ├── deep_select.cpython-314.pyc
+│   │   │   │   │   ├── __init__.cpython-314.pyc
+│   │   │   │   │   ├── keys.cpython-314.pyc
+│   │   │   │   │   ├── models.cpython-314.pyc
+│   │   │   │   │   └── ui.cpython-314.pyc
+│   │   │   │   └── ui.py
+│   │   │   └── types.py
+│   │   └── ui.py
+│   ├── ask
+│   │   ├── command.py
+│   │   ├── __init__.py
+│   │   ├── prompts.py
+│   │   ├── __pycache__
+│   │   │   ├── command.cpython-314.pyc
+│   │   │   ├── __init__.cpython-314.pyc
+│   │   │   ├── prompts.cpython-314.pyc
+│   │   │   └── ui.cpython-314.pyc
+│   │   └── ui.py
+│   ├── cmd
+│   │   ├── command.py
+│   │   ├── __init__.py
+│   │   ├── prompts.py
+│   │   ├── __pycache__
+│   │   │   ├── command.cpython-314.pyc
+│   │   │   ├── __init__.cpython-314.pyc
+│   │   │   ├── prompts.cpython-314.pyc
+│   │   │   └── ui.cpython-314.pyc
+│   │   └── ui.py
+│   ├── __pycache__
+│   │   └── __init__.cpython-314.pyc
+│   └── xray
+├── core
+│   ├── config.py
+│   ├── exec.py
+│   ├── __init__.py
+│   ├── last_error.py
+│   ├── memory.py
+│   ├── paths.py
+│   ├── __pycache__
+│   │   ├── config.cpython-314.pyc
+│   │   ├── exec.cpython-314.pyc
+│   │   ├── __init__.cpython-314.pyc
+│   │   ├── last_error.cpython-314.pyc
+│   │   ├── memory.cpython-314.pyc
+│   │   ├── paths.cpython-314.pyc
+│   │   ├── routing.cpython-314.pyc
+│   │   ├── safety.cpython-314.pyc
+│   │   ├── storage.cpython-314.pyc
+│   │   └── utils.cpython-314.pyc
+│   ├── routing.py
+│   ├── safety.py
+│   ├── storage.py
+│   └── utils.py
+├── __init__.py
+├── __pycache__
+│   └── __init__.cpython-314.pyc
+└── terminal
+    ├── ansi.py
+    ├── __init__.py
+    └── __pycache__
+        ├── ansi.cpython-314.pyc
+        └── __init__.cpython-314.pyc
 
-  app/
-    __init__.py
-    bridge.py                      # root dispatcher: ask|cmd|ai
-    errors.py                      # error app-level (misroute, user misuse)
-
-  core/
-    __init__.py
-    config.py                      # load/merge/validate config
-    paths.py                       # path constants (config, memory, history, dsb)
-    storage.py                     # atomic json read/write + lock
-    routing.py                     # memilih backend/provider + model per mode
-    memory.py                      # load/save context memory
-    last_error.py                  # record/read last error
-    exec.py                        # run argv / run shell safely
-    safety.py                      # evaluate command safety policy
-    types.py                       # dataclass/TypedDict: Config, RouteInfo, dsb
-    utils.py                       # helper umum (text normalize, small utils)
-
-  backends/
-    __init__.py
-    base.py                        # interface backend (ask/cmd/chat)
-    api_openai.py                  # OpenAI API
-    api_gemini.py                  # Gemini API
-    local_ollama.py                # Ollama local
-    errors.py                      # backend exceptions (AuthError, RateLimit, dsb)
-
-  terminal/
-    __init__.py
-    ansi.py                        # terminal primitives (colors, cursor, alt-screen, spinner)
-    text.py                        # wrap/strip_ansi/width helpers
-    input.py                       # input helpers (mute, confirm, readkey)
-    layout.py                      # helper layout generic (columns, tables, bars)
-
-  commands/
-    __init__.py
-
-    ask/
-      __init__.py
-      command.py                   # handle(argv, cfg) -> exit code
-      ui.py                        # output formatting ask (help/result/errors)
-      prompts.py                   # prompt templates ask
-      types.py                     # ask-specific data structures (optional)
-
-    cmd/
-      __init__.py
-      command.py                   # handle(argv, cfg)
-      ui.py                        # output formatting cmd
-      prompts.py                   # prompt templates cmd (optional)
-      planner.py                   # build/validate command plan (optional)
-      types.py                     # cmd-specific data structures (optional)
-
-    ai/
-      __init__.py
-      command.py                   # handle(argv, cfg) -> dispatch subcommands
-      ui.py                        # ai root help + error display
-
-      subcommands/
-        __init__.py
-        registry.py                # register + dispatch subcommands
-        types.py                   # SubcommandSpec, Result, etc
-
-        help/
-          __init__.py
-          command.py               # ai help (subcommand)
-          ui.py                    # ui untuk help output
-
-        status/
-          __init__.py
-          command.py               # ai status (subcommand)
-          ui.py                    # ui untuk status output
-
-        mon/
-          __init__.py
-          command.py               # ai mon (logic/dispatcher mon modes)
-          ui.py                    # mon UI rendering (cockpit/net/battery/disk)
-          history.py               # history engine khusus mon (optional)
-          readers.py               # collectors/sensors parsing (optional)
-          types.py                 # dataclass snapshot (optional)
-
-        gitx/
-          __init__.py
-          command.py
-          ui.py
-
-        ghx/
-          __init__.py
-          command.py
-          ui.py
-
-        run/
-          __init__.py
-          command.py
-          ui.py
+41 directories, 157 files
